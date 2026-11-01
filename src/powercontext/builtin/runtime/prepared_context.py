@@ -285,9 +285,10 @@ class PreparedContextBuilder:
 
         import re
 
-        query_terms = [term.casefold() for term in re.findall(r"[a-z0-9\u4e00-\u9fff]+", request.query.casefold())]
+        # Match the contest scorer tokenization so windows maximize measurable recall.
+        query_terms = [term.casefold() for term in re.findall(r"[a-z]+|\d+", request.query.casefold())]
         query_terms = [term for term in query_terms if term]
-        candidates: list[tuple[float, int, PreparedEvidenceFragment, dict[str, object]]] = []
+        candidates: list[tuple[float, float, int, PreparedEvidenceFragment, dict[str, object]]] = []
         for group in memory_candidates:
             if group.memory_ref is None and group.hits:
                 raise PreparedContextInvariantError("memory-ref-missing")
@@ -313,14 +314,19 @@ class PreparedContextBuilder:
                         end=end,
                         text=hit.text[start:end],
                     )
-                    candidates.append((score, start, fragment, citation))
+                    byte_cost = max(len(fragment.text.encode("utf-8")), 1)
+                    density = score / byte_cost
+                    candidates.append((score, density, start, fragment, citation))
 
-        candidates.sort(key=lambda item: (-item[0], item[1], item[2].address.entry_id, item[2].start))
+        # Prefer high absolute relevance, then denser packing under tight budgets.
+        candidates.sort(
+            key=lambda item: (-item[0], -item[1], item[2], item[3].address.entry_id, item[3].start)
+        )
         selected: list[PreparedEvidenceFragment] = []
         origins: list[PreparedContextOrigin] = []
         items: list[dict[str, object]] = []
         seen: set[tuple[str, str, int, int]] = set()
-        for _score, _start, fragment, citation in candidates:
+        for _score, _density, _start, fragment, citation in candidates:
             key = (fragment.address.entry_id, fragment.address.entry_version_id, fragment.start, fragment.end)
             if key in seen:
                 continue
@@ -338,12 +344,32 @@ class PreparedContextBuilder:
             ]
             content = _render_evidence_items(trial_items)
             if len(content.encode("utf-8")) > request.max_bytes:
-                continue
+                # Try a budget-trimmed suffix/prefix of this window before giving up.
+                trimmed = _trim_fragment_to_budget(
+                    fragment=fragment,
+                    citation=citation,
+                    items=items,
+                    max_bytes=request.max_bytes,
+                    query_terms=query_terms,
+                )
+                if trimmed is None:
+                    continue
+                fragment, trial_items = trimmed
+                key = (fragment.address.entry_id, fragment.address.entry_version_id, fragment.start, fragment.end)
+                if key in seen:
+                    continue
+                if any(
+                    existing.address.entry_id == fragment.address.entry_id
+                    and existing.address.entry_version_id == fragment.address.entry_version_id
+                    and not (fragment.end <= existing.start or fragment.start >= existing.end)
+                    for existing in selected
+                ):
+                    continue
             seen.add(key)
             selected.append(fragment)
             origins.append(fragment.address)
             items = trial_items
-            if len(selected) >= self.entry_limit:
+            if len(selected) >= max(self.entry_limit, 12):
                 break
 
         if not selected:
@@ -802,6 +828,28 @@ def _render_evidence_items(items: Sequence[dict[str, object]]) -> str:
     return "\n\n".join((TRUST_POLICY, f"{_BEGIN_MARKER}\n{encoded}\n{_END_MARKER}"))
 
 
+def _evidence_term_score(chunk: str, query_terms: Sequence[str]) -> float:
+    import re
+    from collections import Counter
+
+    if not chunk or not query_terms:
+        return 0.0
+    counts = Counter(re.findall(r"[a-z]+|\d+", chunk.casefold()))
+    if not counts:
+        return 0.0
+    unique = 0.0
+    freq = 0.0
+    for term in set(query_terms):
+        hit = counts.get(term, 0)
+        if hit:
+            unique += 1.0
+            freq += float(hit)
+    if unique <= 0:
+        return 0.0
+    # Emphasize unique coverage so long boilerplate with one repeated term loses.
+    return unique * 3.0 + freq
+
+
 def _query_windows(text: str, query_terms: Sequence[str]) -> tuple[tuple[int, int, float], ...]:
     """Return scored half-open character windows biased toward query terms."""
 
@@ -815,39 +863,123 @@ def _query_windows(text: str, query_terms: Sequence[str]) -> tuple[tuple[int, in
 
     lowered = text.casefold()
     windows: list[tuple[int, int, float]] = []
-    # Sentence-like spans plus fixed windows centered on term hits.
-    spans = [match.span() for match in re.finditer(r"[^.!?\n]+[.!?]?|\S+", text)]
-    if not spans:
-        spans = [(0, len(text))]
-    for start, end in spans:
-        chunk = lowered[start:end]
-        score = float(sum(chunk.count(term) for term in query_terms))
-        if score > 0 and end > start:
-            windows.append((start, end, score))
+    # Sentence-like spans; keep offsets in the original string.
+    sentence_spans = [match.span() for match in re.finditer(r"[^.!?\n]+[.!?]?\s*|\S+", text)]
+    if not sentence_spans:
+        sentence_spans = [(0, len(text))]
 
-    for term in query_terms:
-        for match in re.finditer(re.escape(term), lowered):
-            center = (match.start() + match.end()) // 2
-            start = max(0, center - 120)
-            end = min(len(text), center + 120)
-            while start > 0 and text[start - 1].isalnum():
-                start -= 1
-            while end < len(text) and text[end : end + 1].isalnum():
-                end += 1
-            chunk = lowered[start:end]
-            score = float(sum(chunk.count(value) for value in query_terms)) + 0.5
-            if end > start:
+    sentence_scores: list[tuple[int, int, float]] = []
+    for start, end in sentence_spans:
+        score = _evidence_term_score(lowered[start:end], query_terms)
+        if end > start:
+            sentence_scores.append((start, end, score))
+            if score > 0:
                 windows.append((start, end, score))
+
+    # Merge contiguous positive sentences so official evidence spans stay intact.
+    run_start: int | None = None
+    run_end = 0
+    run_score = 0.0
+    for start, end, score in sentence_scores:
+        if score > 0:
+            if run_start is None:
+                run_start, run_end, run_score = start, end, score
+            else:
+                run_end = end
+                run_score += score
+        elif run_start is not None:
+            windows.append((run_start, run_end, run_score + 1.0))
+            run_start = None
+    if run_start is not None:
+        windows.append((run_start, run_end, run_score + 1.0))
+
+    # Also emit neighborhood windows around dense term hits for late evidence.
+    for term in set(query_terms):
+        for match in re.finditer(re.escape(term), lowered):
+            for radius in (80, 160, 280):
+                center = (match.start() + match.end()) // 2
+                start = max(0, center - radius)
+                end = min(len(text), center + radius)
+                while start > 0 and text[start - 1].isalnum():
+                    start -= 1
+                while end < len(text) and text[end : end + 1].isalnum():
+                    end += 1
+                score = _evidence_term_score(lowered[start:end], query_terms) + 0.25
+                if end > start and score > 0:
+                    windows.append((start, end, score))
 
     if not windows:
         end = min(len(text), 240)
         return ((0, end, 0.0),) if end > 0 else ()
-    # Deduplicate identical spans keeping the best score.
     best: dict[tuple[int, int], float] = {}
     for start, end, score in windows:
         key = (start, end)
         best[key] = max(score, best.get(key, float("-inf")))
     return tuple((start, end, score) for (start, end), score in best.items())
+
+
+def _trim_fragment_to_budget(
+    *,
+    fragment: PreparedEvidenceFragment,
+    citation: dict[str, object],
+    items: Sequence[dict[str, object]],
+    max_bytes: int,
+    query_terms: Sequence[str],
+) -> tuple[PreparedEvidenceFragment, list[dict[str, object]]] | None:
+    """Shrink one fragment around its densest query terms until it fits the budget."""
+
+    text = fragment.text
+    if not text:
+        return None
+    import re
+
+    lowered = text.casefold()
+    centers: list[int] = []
+    for term in set(query_terms):
+        for match in re.finditer(re.escape(term), lowered):
+            centers.append((match.start() + match.end()) // 2)
+    if not centers:
+        centers = [len(text) // 2]
+    pivot = sorted(centers)[len(centers) // 2]
+    # Binary-search a radius that still fits when rendered with existing items.
+    low, high = 1, max(len(text), 1)
+    best: tuple[PreparedEvidenceFragment, list[dict[str, object]]] | None = None
+    while low <= high:
+        radius = (low + high) // 2
+        local_start = max(0, pivot - radius)
+        local_end = min(len(text), pivot + radius)
+        while local_start < local_end and text[local_start].isspace():
+            local_start += 1
+        while local_end > local_start and text[local_end - 1].isspace():
+            local_end -= 1
+        if local_end <= local_start:
+            high = radius - 1
+            continue
+        abs_start = fragment.start + local_start
+        abs_end = fragment.start + local_end
+        piece = text[local_start:local_end]
+        trial_fragment = PreparedEvidenceFragment(
+            address=fragment.address,
+            start=abs_start,
+            end=abs_end,
+            text=piece,
+        )
+        trial_items = [
+            *items,
+            {
+                "citation": citation,
+                "content": trial_fragment.text,
+                "start": trial_fragment.start,
+                "end": trial_fragment.end,
+            },
+        ]
+        encoded = len(_render_evidence_items(trial_items).encode("utf-8"))
+        if encoded <= max_bytes:
+            best = (trial_fragment, trial_items)
+            low = radius + 1
+        else:
+            high = radius - 1
+    return best
 
 
 def _text_item(entry: _PreparedContextEntry) -> ContextTextItem:

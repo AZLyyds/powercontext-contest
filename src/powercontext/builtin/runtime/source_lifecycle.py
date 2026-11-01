@@ -153,7 +153,12 @@ class SourceLifecycleService:
         if event.sequence == node.sequence:
             if bool(node.available) != bool(event.available):
                 raise SourceLifecycleError("replayed event content conflicts")
-            return sorted(node_id for node_id, item in (await self._load_graph()).nodes.items() if item.available)
+            # Same sequence+content is an idempotent replay. Re-run propagation so a
+            # previously interrupted apply can finish native Memory/Topic syncs without
+            # inventing a new event version. Successful full replays no-op in sync helpers.
+            await self._propagate()
+            graph = await self._load_graph()
+            return sorted(node_id for node_id, item in graph.nodes.items() if item.available)
         node.sequence = event.sequence
         node.available = bool(event.available)
         await self._save_node(node)
