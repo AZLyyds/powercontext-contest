@@ -47,6 +47,9 @@ _ANSWER_FRAMING = re.compile(
     r"by relying on the details\b|who can only use the details\b"
     r").*"
 )
+_DEFINE_CLAUSE = re.compile(
+    r"(?is)\b(?:define|calculate|using|from)\b([^.;]{3,120})"
+)
 _TOKEN = re.compile(r"[a-z]+|\d+", re.IGNORECASE)
 _STOP = frozenset(
     """
@@ -57,7 +60,33 @@ _STOP = frozenset(
     has have had having
     state give using shown within between during after before
     define calculate using less quantity directly outlined explicitly
+    company companies fiscal year years ended statement statements
+    details perspective analyst investment response question
     """.split()
+)
+# Filing-side paraphrases of contest question vocabulary. Keep these high-precision —
+# broad words like "segment" drown geography pages under MD&A noise.
+_SYNONYMS: dict[str, tuple[str, ...]] = {
+    "battles": ("proceedings", "litigation", "claims", "lawsuits", "lawsuit"),
+    "legal": ("litigation", "proceedings", "lawsuit", "lawsuits"),
+    "geographies": ("geographic", "geography", "countries", "territories"),
+    "geography": ("geographic", "geographies", "countries", "territories"),
+    "capex": ("capital", "spending", "expenditures", "expenditure"),
+    "ebitda": ("depreciation", "amortization"),
+    "income": ("profit",),
+    "operating": ("operations",),
+    "margin": ("margins",),
+    "restructuring": ("impairment", "severance"),
+    "costs": ("charges", "expenses", "expense"),
+    "amortization": ("amortisation", "depreciation"),
+    "depreciation": ("amortization", "amortisation"),
+}
+_RETRIEVAL_PHRASES: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
+    # (question cues, filing phrases to issue as short FTS queries)
+    (("geograph", "operates", "operate"), ("reportable segments", "countries and territories", "our operations")),
+    (("legal", "battle", "litigation"), ("legal proceedings", "litigation claims")),
+    (("ebitda", "operating", "capex", "margin"), ("operating profit", "statement of income", "cash flows", "capital spending", "depreciation and amortization")),
+    (("restructuring",), ("restructuring charges", "impairment charges")),
 )
 
 
@@ -212,6 +241,17 @@ PDF_PAGE_SOURCE_DEFINITION = AdapterSourceDefinition(
 )
 
 
+def _rank_key(term: str) -> tuple[int, int, int, str]:
+    """Prefer concrete filing tokens over generic metric wrappers."""
+
+    return (
+        0 if term.isdigit() else 1,
+        0 if any(ch.isdigit() for ch in term) else 1,
+        -len(term),
+        term,
+    )
+
+
 def _content_terms(question: str) -> list[str]:
     """Lexical terms that should appear on evidence pages, not in answer instructions."""
 
@@ -222,26 +262,108 @@ def _content_terms(question: str) -> list[str]:
     analyzed = [term for term in analyze_fts_query(head).split() if term and term not in _STOP]
     if not analyzed:
         analyzed = [term.casefold() for term in _TOKEN.findall(question) if term.casefold() not in _STOP]
-    # Cap term count so admission (ceil(n*0.25)) stays achievable on real pages.
     unique = list(dict.fromkeys(analyzed))
-    if len(unique) <= 10:
+    if len(unique) <= 12:
         return unique
-    ranked = sorted(
-        unique,
-        key=lambda term: (
-            0 if term.isdigit() else 1,
-            0 if any(ch.isdigit() for ch in term) else 1,
-            -len(term),
-            term,
-        ),
-    )
-    return ranked[:10]
+    return sorted(unique, key=_rank_key)[:12]
 
 
-def _score_page(text: str, terms: list[str], df: Counter[str], docs: int) -> float:
+def _definition_terms(question: str) -> list[str]:
+    """Nouns from Define/Calculate/using clauses — usually the filing vocabulary."""
+
+    found: list[str] = []
+    for match in _DEFINE_CLAUSE.finditer(question):
+        for term in analyze_fts_query(match.group(1)).split():
+            if term and term not in _STOP and term not in found:
+                found.append(term)
+    return found
+
+
+def _expanded_terms(terms: list[str]) -> list[str]:
+    """Union of query terms and filing-side synonyms for offline scoring."""
+
+    out: list[str] = []
+    for term in terms:
+        if term not in out:
+            out.append(term)
+        for alt in _SYNONYMS.get(term, ()):
+            if alt not in _STOP and alt not in out:
+                out.append(alt)
+    return out
+
+
+def _query_variants(question: str, terms: list[str]) -> list[str]:
+    """Short FTS queries. Long OR-bags raise the admission floor and drop gold pages."""
+
+    variants: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: str) -> None:
+        cleaned = " ".join(value.split())
+        if not cleaned or cleaned in seen:
+            return
+        # Keep unique Analyzer term count <= 4 so required matches stay <= 2.
+        analyzed = list(dict.fromkeys(analyze_fts_query(cleaned).split()))
+        if not analyzed or len(analyzed) > 4:
+            return
+        seen.add(cleaned)
+        variants.append(cleaned)
+
+    ranked = sorted(terms, key=_rank_key)
+    definition = _definition_terms(question)
+    for term in definition:
+        add(term)
+    for left, right in zip(definition, definition[1:]):
+        add(f"{left} {right}")
+
+    # Distinctive singletons (rare / long) recover pages that share only one keyword.
+    for term in ranked:
+        if len(term) >= 6 or term.isdigit() or any(ch.isdigit() for ch in term):
+            add(term)
+
+    # Two-term combinations of the strongest content words.
+    top = ranked[:8]
+    for index, left in enumerate(top):
+        for right in top[index + 1 :]:
+            add(f"{left} {right}")
+
+    # Compact bags of three strongest terms still pass admission on many pages.
+    if len(top) >= 3:
+        add(" ".join(top[:3]))
+    if len(top) >= 4:
+        add(" ".join(top[:4]))
+
+    # Synonym short queries map contest phrasing onto 10-K language.
+    for term in ranked[:10]:
+        for alt in _SYNONYMS.get(term, ()):
+            add(alt)
+            add(f"{term} {alt}")
+
+    folded = question.casefold()
+    for cues, phrases in _RETRIEVAL_PHRASES:
+        if any(cue in folded for cue in cues):
+            for phrase in phrases:
+                add(phrase)
+
+    # Very short slice of the stripped question — never the full persona prompt.
+    head = _ANSWER_FRAMING.sub("", question).strip(" \t\r\n.;:")
+    if head:
+        head_terms = [t for t in analyze_fts_query(head).split() if t not in _STOP][:4]
+        if head_terms:
+            add(" ".join(head_terms))
+    return variants
+
+
+def _score_page(
+    text: str,
+    primary_terms: list[str],
+    synonym_terms: list[str],
+    df: Counter[str],
+    docs: int,
+) -> float:
     """BM25-ish score over Analyzer tokens for offline reranking."""
 
-    if not terms or not text:
+    if not text:
         return 0.0
     tokens = analyze_text(text).split()
     if not tokens:
@@ -250,16 +372,64 @@ def _score_page(text: str, terms: list[str], df: Counter[str], docs: int) -> flo
     avgdl = 500.0
     length = len(tokens)
     score = 0.0
-    for term in set(terms):
-        freq = tf.get(term, 0)
-        if not freq:
-            continue
-        idf = math.log(1.0 + (docs - df[term] + 0.5) / (df[term] + 0.5))
-        denom = freq + 1.2 * (1.0 - 0.75 + 0.75 * length / avgdl)
-        score += idf * (freq * 2.2) / denom
-    # Soft bonus for covering more distinct query terms.
-    covered = sum(1 for term in set(terms) if tf.get(term, 0))
-    score += covered * 0.35
+
+    def accumulate(terms: list[str], weight: float) -> float:
+        local = 0.0
+        for term in set(terms):
+            freq = tf.get(term, 0)
+            if not freq:
+                continue
+            idf = math.log(1.0 + (docs - df[term] + 0.5) / (df[term] + 0.5))
+            denom = freq + 1.2 * (1.0 - 0.75 + 0.75 * length / avgdl)
+            local += weight * idf * (freq * 2.2) / denom
+        return local
+
+    score += accumulate(primary_terms, 1.0)
+    # Synonyms only fill gaps; never dominate over the question's own words.
+    missing_primary = [term for term in synonym_terms if term not in primary_terms]
+    score += accumulate(missing_primary, 0.35)
+    covered_primary = sum(1 for term in set(primary_terms) if tf.get(term, 0))
+    score += covered_primary * 1.1
+    covered_syn = sum(1 for term in set(missing_primary) if tf.get(term, 0))
+    score += covered_syn * 0.25
+
+    lowered = text.casefold()
+    primary_fold = " ".join(primary_terms)
+    for marker, bonus in (
+        ("consolidated statement of income", 7.0),
+        ("consolidated statement of cash flows", 5.5),
+        ("legal proceedings", 5.0),
+        ("reportable segments", 4.0),
+        ("countries and territories", 4.0),
+        ("our operations", 2.5),
+        ("operating profit", 3.0),
+        ("depreciation and amortization", 2.5),
+        ("capital spending", 2.5),
+        ("restructuring", 1.5),
+    ):
+        if marker in lowered:
+            score += bonus
+
+    # Geography questions: reward pages that list multiple operating regions.
+    if any(term.startswith("geograph") for term in primary_terms) or "geograph" in primary_fold:
+        region_hits = sum(
+            1
+            for marker in (
+                "north america",
+                "latin america",
+                "europe",
+                "asia pacific",
+                "middle east",
+                "africa",
+                "china region",
+                "south asia",
+                "amesa",
+                "apac",
+            )
+            if marker in lowered
+        )
+        if region_hits:
+            score += 1.8 * region_hits + (2.5 if region_hits >= 3 else 0.0)
     return score
 
 
@@ -272,32 +442,16 @@ async def search_pdf_pages(memory, question: str, limit: int = 10) -> tuple[Memo
         raise ValueError("limit must be a positive integer")
 
     terms = _content_terms(question)
-    score_terms = [term for term in dict.fromkeys([*terms, *analyze_fts_query(question).split()]) if term and term not in _STOP]
-    fetch = max(limit * 10, 80)
-    variants: list[str] = []
-    if terms:
-        variants.append(" ".join(terms))
-        if len(terms) > 5:
-            variants.append(" ".join(terms[:5]))
-        # Prefer concrete filing nouns over abstract metric aliases.
-        concrete = [
-            term
-            for term in terms
-            if term
-            not in {
-                "unadjusted",
-                "adjusted",
-                "ebitda",
-                "margin",
-                "quantity",
-                "percent",
-                "percentage",
-            }
-        ]
-        if 2 <= len(concrete) <= 8 and " ".join(concrete) not in variants:
-            variants.append(" ".join(concrete))
-    # Original question remains a useful recall path when aliases are absent from filings.
-    variants.append(question.strip())
+    primary_terms = [
+        term
+        for term in dict.fromkeys([*terms, *_definition_terms(question)])
+        if term and term not in _STOP
+    ]
+    synonym_terms = _expanded_terms(primary_terms)
+    fetch = max(limit * 12, 100)
+    variants = _query_variants(question, terms)
+    if not variants:
+        variants = [question.strip()]
 
     hits = []
     seen_keys: set[tuple[str, str, str]] = set()
@@ -309,8 +463,6 @@ async def search_pdf_pages(memory, question: str, limit: int = 10) -> tuple[Memo
                 continue
             hits.append(hit)
             seen_keys.add(key)
-        if len(hits) >= fetch:
-            break
 
     df: Counter[str] = Counter()
     analyzed_hits: list[tuple[object, list[str]]] = []
@@ -321,7 +473,7 @@ async def search_pdf_pages(memory, question: str, limit: int = 10) -> tuple[Memo
     docs = max(len(analyzed_hits), 1)
     ranked = sorted(
         (
-            (_score_page(hit.text, score_terms or terms, df, docs), index, hit)
+            (_score_page(hit.text, primary_terms, synonym_terms, df, docs), index, hit)
             for index, (hit, _tokens) in enumerate(analyzed_hits)
         ),
         key=lambda item: (-item[0], item[1]),

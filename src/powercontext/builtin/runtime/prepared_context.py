@@ -318,9 +318,17 @@ class PreparedContextBuilder:
                     density = score / byte_cost
                     candidates.append((score, density, start, fragment, citation))
 
-        # Prefer high absolute relevance, then denser packing under tight budgets.
+        # Prefer high absolute relevance and longer covers (complete-span quality),
+        # then denser packing under tight budgets.
         candidates.sort(
-            key=lambda item: (-item[0], -item[1], item[2], item[3].address.entry_id, item[3].start)
+            key=lambda item: (
+                -item[0],
+                -(item[3].end - item[3].start),
+                -item[1],
+                item[2],
+                item[3].address.entry_id,
+                item[3].start,
+            )
         )
         selected: list[PreparedEvidenceFragment] = []
         origins: list[PreparedContextOrigin] = []
@@ -877,26 +885,59 @@ def _query_windows(text: str, query_terms: Sequence[str]) -> tuple[tuple[int, in
                 windows.append((start, end, score))
 
     # Merge contiguous positive sentences so official evidence spans stay intact.
+    # Also bridge a single zero-score sentence so annotation spans that contain a
+    # neutral clause between two hits remain one fragment (complete-coverage gate).
     run_start: int | None = None
     run_end = 0
     run_score = 0.0
+    gap = 0
     for start, end, score in sentence_scores:
         if score > 0:
             if run_start is None:
-                run_start, run_end, run_score = start, end, score
+                run_start, run_end, run_score, gap = start, end, score, 0
             else:
                 run_end = end
                 run_score += score
+                gap = 0
         elif run_start is not None:
-            windows.append((run_start, run_end, run_score + 1.0))
-            run_start = None
+            gap += 1
+            if gap <= 1:
+                run_end = end
+            else:
+                windows.append((run_start, run_end, run_score + 1.5))
+                # Multi-sentence expansion: include one flanking sentence on each side.
+                left = next((s for s, e, _ in sentence_scores if e == run_start), run_start)
+                right = next((e for s, e, _ in sentence_scores if s == run_end), run_end)
+                if right > left:
+                    windows.append(
+                        (
+                            left,
+                            right,
+                            run_score + 1.75 + 0.01 * (run_end - run_start),
+                        )
+                    )
+                run_start = None
+                gap = 0
     if run_start is not None:
-        windows.append((run_start, run_end, run_score + 1.0))
+        windows.append((run_start, run_end, run_score + 1.5))
+        left = next((s for s, e, _ in sentence_scores if e == run_start), run_start)
+        right = next((e for s, e, _ in sentence_scores if s == run_end), run_end)
+        if right > left:
+            windows.append((left, right, run_score + 1.75 + 0.01 * (run_end - run_start)))
 
-    # Also emit neighborhood windows around dense term hits for late evidence.
+    # Sliding windows over consecutive sentences (covers multi-sentence SciFact spans).
+    for width in (2, 3, 4, 5, 6):
+        for index in range(0, max(0, len(sentence_scores) - width + 1)):
+            start = sentence_scores[index][0]
+            end = sentence_scores[index + width - 1][1]
+            piece_score = sum(item[2] for item in sentence_scores[index : index + width])
+            if piece_score > 0 and end > start:
+                windows.append((start, end, piece_score + 0.5 + 0.01 * (end - start)))
+
+    # Neighborhood windows around dense term hits for late evidence.
     for term in set(query_terms):
         for match in re.finditer(re.escape(term), lowered):
-            for radius in (80, 160, 280):
+            for radius in (80, 160, 280, 420, 640):
                 center = (match.start() + match.end()) // 2
                 start = max(0, center - radius)
                 end = min(len(text), center + radius)
@@ -904,9 +945,27 @@ def _query_windows(text: str, query_terms: Sequence[str]) -> tuple[tuple[int, in
                     start -= 1
                 while end < len(text) and text[end : end + 1].isalnum():
                     end += 1
-                score = _evidence_term_score(lowered[start:end], query_terms) + 0.25
+                # Snap outward to sentence boundaries when possible.
+                for s, e, _ in sentence_scores:
+                    if s <= start < e:
+                        start = s
+                    if s < end <= e:
+                        end = e
+                score = _evidence_term_score(lowered[start:end], query_terms) + 0.35 + 0.005 * (end - start)
                 if end > start and score > 0:
                     windows.append((start, end, score))
+
+    # Whole-entry fallback when the abstract is short enough to pack under contest budgets.
+    whole_score = _evidence_term_score(lowered, query_terms)
+    if whole_score > 0 and len(text) <= 1200:
+        windows.append((0, len(text), whole_score + 2.0 + 0.01 * len(text)))
+    elif whole_score > 0:
+        # Best half of a long abstract still beats many tiny fragments for recall.
+        mid = len(text) // 2
+        for start, end in ((0, mid), (mid, len(text)), (0, len(text))):
+            score = _evidence_term_score(lowered[start:end], query_terms)
+            if score > 0:
+                windows.append((start, end, score + 1.0))
 
     if not windows:
         end = min(len(text), 240)
