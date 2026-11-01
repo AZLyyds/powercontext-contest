@@ -93,6 +93,28 @@ class PreparedContextOmissions:
 
 
 @dataclass(frozen=True)
+class MemoryEntryAddress:
+    """Identify one exact Memory entry version across Scope boundaries."""
+
+    memory: ArtifactAddress
+    entry_id: str
+    entry_version_id: str
+
+
+PreparedContextOrigin = MemoryCitation | ArtifactRef | MemoryEntryAddress | ArtifactAddress
+
+
+@dataclass(frozen=True)
+class PreparedEvidenceFragment:
+    """One exact Memory substring selected for the current query."""
+
+    address: MemoryEntryAddress
+    start: int
+    end: int
+    text: str
+
+
+@dataclass(frozen=True)
 class PreparedContextBuild:
     """Final public context and the exact origins selected to produce it.
 
@@ -106,18 +128,7 @@ class PreparedContextBuild:
     origins: tuple[PreparedContextOrigin, ...]
     omissions: PreparedContextOmissions = PreparedContextOmissions()
     code_origins: tuple[CodeEvidenceRef, ...] = ()
-
-
-@dataclass(frozen=True)
-class MemoryEntryAddress:
-    """Identify one exact Memory entry version across Scope boundaries."""
-
-    memory: ArtifactAddress
-    entry_id: str
-    entry_version_id: str
-
-
-PreparedContextOrigin = MemoryCitation | ArtifactRef | MemoryEntryAddress | ArtifactAddress
+    fragments: tuple[PreparedEvidenceFragment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -235,6 +246,13 @@ class PreparedContextBuilder:
         if sum(len(candidates.hits) for candidates in experience_candidates) > self.experience_candidate_limit:
             raise PreparedContextInvariantError("experience-candidate-limit")
 
+        if request.evidence_selection:
+            return self._build_evidence_selection(
+                request=request,
+                current_scope_id=current_scope_id,
+                memory_candidates=memory_candidates,
+            )
+
         content, origins, omissions = self._select_entries(
             request=request,
             current_scope_id=current_scope_id,
@@ -254,6 +272,90 @@ class PreparedContextBuilder:
             context=PreparedContext(status="ready", content=content, content_bytes=content_bytes),
             origins=origins,
             omissions=omissions,
+        )
+
+    def _build_evidence_selection(
+        self,
+        *,
+        request: PrepareContextRequest,
+        current_scope_id: str | None,
+        memory_candidates: Sequence[PreparedMemoryCandidates],
+    ) -> PreparedContextBuild:
+        """Select query-relevant Memory substrings within the UTF-8 byte budget."""
+
+        import re
+
+        query_terms = [term.casefold() for term in re.findall(r"[a-z0-9\u4e00-\u9fff]+", request.query.casefold())]
+        query_terms = [term for term in query_terms if term]
+        candidates: list[tuple[float, int, PreparedEvidenceFragment, dict[str, object]]] = []
+        for group in memory_candidates:
+            if group.memory_ref is None and group.hits:
+                raise PreparedContextInvariantError("memory-ref-missing")
+            scope_id = group.scope_id or current_scope_id or ""
+            for hit in group.hits:
+                if not hit.text.strip():
+                    continue
+                address = MemoryEntryAddress(
+                    memory=ArtifactAddress(scope_id=scope_id, artifact=hit.memory_ref),
+                    entry_id=hit.entry_id,
+                    entry_version_id=hit.entry_version_id,
+                )
+                citation = {
+                    "scope_id": scope_id,
+                    "memory_ref": hit.memory_ref.model_dump(mode="json"),
+                    "entry_id": hit.entry_id,
+                    "entry_version_id": hit.entry_version_id,
+                }
+                for start, end, score in _query_windows(hit.text, query_terms):
+                    fragment = PreparedEvidenceFragment(
+                        address=address,
+                        start=start,
+                        end=end,
+                        text=hit.text[start:end],
+                    )
+                    candidates.append((score, start, fragment, citation))
+
+        candidates.sort(key=lambda item: (-item[0], item[1], item[2].address.entry_id, item[2].start))
+        selected: list[PreparedEvidenceFragment] = []
+        origins: list[PreparedContextOrigin] = []
+        items: list[dict[str, object]] = []
+        seen: set[tuple[str, str, int, int]] = set()
+        for _score, _start, fragment, citation in candidates:
+            key = (fragment.address.entry_id, fragment.address.entry_version_id, fragment.start, fragment.end)
+            if key in seen:
+                continue
+            # Prefer non-overlapping coverage within one entry.
+            if any(
+                existing.address.entry_id == fragment.address.entry_id
+                and existing.address.entry_version_id == fragment.address.entry_version_id
+                and not (fragment.end <= existing.start or fragment.start >= existing.end)
+                for existing in selected
+            ):
+                continue
+            trial_items = [
+                *items,
+                {"citation": citation, "content": fragment.text, "start": fragment.start, "end": fragment.end},
+            ]
+            content = _render_evidence_items(trial_items)
+            if len(content.encode("utf-8")) > request.max_bytes:
+                continue
+            seen.add(key)
+            selected.append(fragment)
+            origins.append(fragment.address)
+            items = trial_items
+            if len(selected) >= self.entry_limit:
+                break
+
+        if not selected:
+            return PreparedContextBuild(context=self.empty(), origins=(), fragments=())
+        content = _render_evidence_items(items)
+        content_bytes = len(content.encode("utf-8"))
+        if content_bytes > request.max_bytes:
+            raise PreparedContextInvariantError("output-budget")
+        return PreparedContextBuild(
+            context=PreparedContext(status="ready", content=content, content_bytes=content_bytes),
+            origins=tuple(origins),
+            fragments=tuple(selected),
         )
 
     def probe_budget(
@@ -692,6 +794,60 @@ def _render(entries: Sequence[_PreparedContextEntry]) -> str:
     }
     encoded = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
     return "\n\n".join((TRUST_POLICY, f"{_BEGIN_MARKER}\n{encoded}\n{_END_MARKER}"))
+
+
+def _render_evidence_items(items: Sequence[dict[str, object]]) -> str:
+    envelope = {"trust": "untrusted_history", "items": list(items)}
+    encoded = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+    return "\n\n".join((TRUST_POLICY, f"{_BEGIN_MARKER}\n{encoded}\n{_END_MARKER}"))
+
+
+def _query_windows(text: str, query_terms: Sequence[str]) -> tuple[tuple[int, int, float], ...]:
+    """Return scored half-open character windows biased toward query terms."""
+
+    import re
+
+    if not text:
+        return ()
+    if not query_terms:
+        end = min(len(text), 240)
+        return ((0, end, 0.0),) if end > 0 else ()
+
+    lowered = text.casefold()
+    windows: list[tuple[int, int, float]] = []
+    # Sentence-like spans plus fixed windows centered on term hits.
+    spans = [match.span() for match in re.finditer(r"[^.!?\n]+[.!?]?|\S+", text)]
+    if not spans:
+        spans = [(0, len(text))]
+    for start, end in spans:
+        chunk = lowered[start:end]
+        score = float(sum(chunk.count(term) for term in query_terms))
+        if score > 0 and end > start:
+            windows.append((start, end, score))
+
+    for term in query_terms:
+        for match in re.finditer(re.escape(term), lowered):
+            center = (match.start() + match.end()) // 2
+            start = max(0, center - 120)
+            end = min(len(text), center + 120)
+            while start > 0 and text[start - 1].isalnum():
+                start -= 1
+            while end < len(text) and text[end : end + 1].isalnum():
+                end += 1
+            chunk = lowered[start:end]
+            score = float(sum(chunk.count(value) for value in query_terms)) + 0.5
+            if end > start:
+                windows.append((start, end, score))
+
+    if not windows:
+        end = min(len(text), 240)
+        return ((0, end, 0.0),) if end > 0 else ()
+    # Deduplicate identical spans keeping the best score.
+    best: dict[tuple[int, int], float] = {}
+    for start, end, score in windows:
+        key = (start, end)
+        best[key] = max(score, best.get(key, float("-inf")))
+    return tuple((start, end, score) for (start, end), score in best.items())
 
 
 def _text_item(entry: _PreparedContextEntry) -> ContextTextItem:

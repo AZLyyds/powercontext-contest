@@ -36,10 +36,12 @@ from powercontext.builtin.artifacts.topic_memory import (
     TopicMemory,
     TopicMemoryBrowseCursor,
     TopicMemoryCapabilityError,
+    TopicMemoryChannelHit,
     TopicMemoryCurrentItem,
     TopicMemoryDraft,
     TopicMemoryProjection,
     TopicMemoryProjectionError,
+    TopicMemorySearchChannels,
     TopicMemorySearchMode,
     TopicMemorySearchRequest,
     TopicMemorySearchResult,
@@ -487,6 +489,7 @@ class TopicMemoryRepository:
             admission=admission,
         )
         channels = await self.index.search(connection, scope_id, request)
+        channels = await self._filter_governed_active_channels(connection, scope_id, channels)
         await self._check_retrieval_shape(connection)
         outcome = _fuse_topic_memory_rankings(query, channels, limit, mode=used_mode, admission=admission)
         return TopicMemorySearchResult(
@@ -519,6 +522,17 @@ class TopicMemoryRepository:
                 published_at=published_at,
             )
         )
+        await self._project_active(connection, scope_id, topic, projection)
+        return published_at
+
+    async def _project_active(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        topic: TopicMemory,
+        projection: TopicMemoryProjection,
+    ) -> None:
+        ref = topic.as_ref()
         await self.index.replace(connection, scope_id, ref, projection)
         await connection.execute(
             delete(TOPIC_MEMORY_ACTIVE_CHUNKS_TABLE).where(
@@ -544,25 +558,64 @@ class TopicMemoryRepository:
                 source_count=len(topic.lineage.sources),
             )
         )
-        await connection.execute(
-            insert(TOPIC_MEMORY_ACTIVE_CHUNKS_TABLE),
-            [
-                {
-                    "scope_id": scope_id,
-                    "family": TopicMemory.family,
-                    "artifact_id": ref.artifact_id,
-                    "revision": ref.revision,
-                    "chunk_ordinal": chunk.ordinal,
-                    "start_offset": chunk.start_offset,
-                    "end_offset": chunk.end_offset,
-                    "chunk_text": chunk.text,
-                    "searchable_text": analyze_text(chunk.text),
-                    "policy_version": chunk.policy_version,
-                }
-                for chunk in projection.chunks
-            ],
+        if projection.chunks:
+            await connection.execute(
+                insert(TOPIC_MEMORY_ACTIVE_CHUNKS_TABLE),
+                [
+                    {
+                        "scope_id": scope_id,
+                        "family": TopicMemory.family,
+                        "artifact_id": ref.artifact_id,
+                        "revision": ref.revision,
+                        "chunk_ordinal": chunk.ordinal,
+                        "start_offset": chunk.start_offset,
+                        "end_offset": chunk.end_offset,
+                        "chunk_text": chunk.text,
+                        "searchable_text": analyze_text(chunk.text),
+                        "policy_version": chunk.policy_version,
+                    }
+                    for chunk in projection.chunks
+                ],
+            )
+
+    async def _filter_governed_active_channels(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        channels: TopicMemorySearchChannels,
+    ) -> TopicMemorySearchChannels:
+        """Drop candidates whose Artifact head is not lifecycle-active."""
+
+        active_ids = {
+            str(row[0])
+            for row in (
+                await connection.execute(
+                    select(ARTIFACT_HEADS_TABLE.c.artifact_id).where(
+                        ARTIFACT_HEADS_TABLE.c.scope_id == scope_id,
+                        ARTIFACT_HEADS_TABLE.c.family == TopicMemory.family,
+                        ARTIFACT_HEADS_TABLE.c.lifecycle_state == "active",
+                    )
+                )
+            ).all()
+        }
+
+        def keep(hits: tuple[TopicMemoryChannelHit, ...]) -> tuple[TopicMemoryChannelHit, ...]:
+            return tuple(hit for hit in hits if hit.artifact_ref.artifact_id in active_ids)
+
+        return TopicMemorySearchChannels(
+            topic_fts=keep(channels.topic_fts),
+            topic_vector=keep(channels.topic_vector),
+            detail_fts=keep(channels.detail_fts),
+            detail_vector=keep(channels.detail_vector),
+            topic_fts_retrieved=channels.topic_fts_retrieved,
+            topic_vector_retrieved=channels.topic_vector_retrieved,
+            detail_fts_retrieved=channels.detail_fts_retrieved,
+            detail_vector_retrieved=channels.detail_vector_retrieved,
+            topic_fts_eligible=channels.topic_fts_eligible,
+            topic_vector_eligible=channels.topic_vector_eligible,
+            detail_fts_eligible=channels.detail_fts_eligible,
+            detail_vector_eligible=channels.detail_vector_eligible,
         )
-        return published_at
 
     def _validate_projection(
         self,

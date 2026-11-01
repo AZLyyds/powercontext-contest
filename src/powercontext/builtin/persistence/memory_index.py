@@ -247,6 +247,15 @@ class CompositeMemoryIndex:
         request: MemorySearchRequest,
         /,
     ) -> MemorySearchChannels:
+        if request.mode == "hybrid" and self.capabilities.hybrid and len(self.indexes) == 2:
+            vector_indexes = tuple(index for index in self.indexes if index.capabilities.vector)
+            if (
+                len(vector_indexes) == 1
+                and type(vector_indexes[0]).__module__.endswith("oceanbase.memory_index")
+            ):
+                from powercontext.builtin.persistence.oceanbase.memory_index import search_oceanbase_hybrid
+
+                return await search_oceanbase_hybrid(vector_indexes[0], connection, scope_id, request)
         fts: tuple[MemoryChannelHit, ...] = ()
         vector: tuple[MemoryChannelHit, ...] = ()
         for index in self.indexes:

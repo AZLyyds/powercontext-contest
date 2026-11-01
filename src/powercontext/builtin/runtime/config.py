@@ -137,6 +137,19 @@ class RuntimeConfig(BaseModel):
 
     scope_cache_size: int = Field(default=DEFAULT_SCOPE_CACHE_SIZE, ge=1)
     source_window_limit: int = Field(default=100, ge=1)
+    memory_source_count_threshold: int | None = Field(default=None, ge=1)
+    topic_memory_source_count_threshold: int | None = Field(default=None, ge=1)
+
+    @field_validator("memory_source_count_threshold", "topic_memory_source_count_threshold", mode="before")
+    @classmethod
+    def reject_non_strict_positive_count_threshold(cls, value: Any) -> Any:
+        if value is None:
+            return value
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("source count threshold must be a strict positive integer")  # noqa: TRY003
+        if value < 1:
+            raise ValueError("source count threshold must be a strict positive integer")  # noqa: TRY003
+        return value
     context_assembly_max_entries: int = Field(default=8, ge=1)
     memory_extraction_profile: MemoryExtractionProfile = MemoryExtractionProfile.CODING
     memory_rerank_enabled: bool = False

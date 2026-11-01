@@ -353,6 +353,17 @@ class SQLiteTopicMemoryFTSIndex:
         if marker is None:
             await connection.execute(insert(SQLITE_TOPIC_MEMORY_FTS_MARKER_TABLE).values(singleton=1, schema_version=1))
 
+    async def clear(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        topic_ref: ArtifactRef,
+        /,
+    ) -> None:
+        identity = {"scope_id": scope_id, "artifact_id": topic_ref.artifact_id}
+        await connection.execute(_DELETE_TOPIC_FTS_SQL, identity)
+        await connection.execute(_DELETE_CHUNK_FTS_SQL, identity)
+
     async def replace(
         self,
         connection: AsyncConnection,
@@ -362,8 +373,7 @@ class SQLiteTopicMemoryFTSIndex:
         /,
     ) -> None:
         identity = {"scope_id": scope_id, "artifact_id": topic_ref.artifact_id}
-        await connection.execute(_DELETE_TOPIC_FTS_SQL, identity)
-        await connection.execute(_DELETE_CHUNK_FTS_SQL, identity)
+        await self.clear(connection, scope_id, topic_ref)
         topic_values = {
             **identity,
             "revision": topic_ref.revision,
@@ -537,6 +547,15 @@ class SQLiteTopicMemoryVectorIndex:
         except SQLAlchemyError as error:
             raise TopicMemoryCapabilityError("vector", f"sqlite-vec probe failed: {error}") from error
 
+    async def clear(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        topic_ref: ArtifactRef,
+        /,
+    ) -> None:
+        await self._delete_existing(connection, scope_id, topic_ref.artifact_id)
+
     async def replace(
         self,
         connection: AsyncConnection,
@@ -545,7 +564,7 @@ class SQLiteTopicMemoryVectorIndex:
         projection: TopicMemoryProjection,
         /,
     ) -> None:
-        await self._delete_existing(connection, scope_id, topic_ref.artifact_id)
+        await self.clear(connection, scope_id, topic_ref)
         if projection.topic_embedding is None or len(projection.chunk_embeddings) != len(projection.chunks):
             raise TopicMemoryCapabilityError("vector", "projection is incomplete")
         inserted = await connection.execute(

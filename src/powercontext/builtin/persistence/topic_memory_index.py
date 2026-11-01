@@ -94,6 +94,15 @@ class NoTopicMemoryIndex:
     ) -> None:
         pass
 
+    async def clear(
+        self,
+        _connection: AsyncConnection,
+        _scope_id: str,
+        _topic_ref: ArtifactRef,
+        /,
+    ) -> None:
+        pass
+
     async def search(
         self,
         _connection: AsyncConnection,
@@ -149,6 +158,18 @@ class CompositeTopicMemoryIndex:
     ) -> None:
         for index in self.indexes:
             await index.replace(connection, scope_id, topic_ref, projection)
+
+    async def clear(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        topic_ref: ArtifactRef,
+        /,
+    ) -> None:
+        for index in self.indexes:
+            clearer = getattr(index, "clear", None)
+            if clearer is not None:
+                await clearer(connection, scope_id, topic_ref)
 
     async def search(
         self,
