@@ -80,13 +80,47 @@ _SYNONYMS: dict[str, tuple[str, ...]] = {
     "costs": ("charges", "expenses", "expense"),
     "amortization": ("amortisation", "depreciation"),
     "depreciation": ("amortization", "amortisation"),
+    "cyclicality": ("cyclical", "cycle"),
+    "cyclical": ("cyclicality", "cycle"),
+    "liquidity": ("liquid", "quick"),
+    "concentration": ("concentrated", "accounted"),
+    "customers": ("customer", "clients"),
+    "customer": ("customers", "client"),
+    "debt": ("borrowings", "notes"),
 }
 _RETRIEVAL_PHRASES: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
     # (question cues, filing phrases to issue as short FTS queries)
     (("geograph", "operates", "operate"), ("reportable segments", "countries and territories", "our operations")),
-    (("legal", "battle", "litigation"), ("legal proceedings", "litigation claims")),
-    (("ebitda", "operating", "capex", "margin"), ("operating profit", "statement of income", "cash flows", "capital spending", "depreciation and amortization")),
+    (("legal", "battle", "litigation"), ("legal proceedings", "litigation claims", "litigation", "lawsuits")),
+    (
+        ("ebitda", "operating", "capex", "margin", "gross"),
+        (
+            "operating profit",
+            "operating income",
+            "statement of income",
+            "statements of operations",
+            "statements of income",
+            "gross profit",
+            "cost of sales",
+            "sales of products",
+            "cash flows",
+            "capital spending",
+            "depreciation and amortization",
+        ),
+    ),
     (("restructuring",), ("restructuring charges", "impairment charges")),
+    (("liquidity", "quick", "current ratio", "working capital"), ("balance sheets", "current assets", "cash and cash equivalents")),
+    (("cash flow", "financing", "investing"), ("statements of cash flows", "cash flows from operating", "cash flows from investing", "cash flows from financing")),
+    (("customer", "concentration", "customers"), ("accounted for", "consolidated net revenue", "significant customers", "major customers", "one customer")),
+    (("revenue", "segment", "categories", "percent", "products", "services"), ("business segment", "net sales", "net revenue", "segment data", "summary of business segment")),
+    (("balance sheet", "assets", "liabilities", "equity", "debt"), ("consolidated balance sheets", "total assets", "long-term debt", "outstanding long-term debt")),
+    (("capital-intensive", "capital intensive", "ppne", "ppe", "pp&e"), ("property plant and equipment", "property and equipment", "capital expenditures", "depreciation")),
+    (("cyclical", "cyclicality"), ("cyclical", "commercial airlines", "airline industry", "defense")),
+    (("tax", "effective tax"), ("income tax", "effective tax rate", "provision for income taxes")),
+    (
+        ("customer", "customers", "products", "services", "sells"),
+        ("item 1", "commercial airlines", "government contracts", "data center", "cpu", "gpu"),
+    ),
 )
 
 
@@ -295,10 +329,11 @@ def _expanded_terms(terms: list[str]) -> list[str]:
 def _query_variants(question: str, terms: list[str]) -> list[str]:
     """Short FTS queries. Long OR-bags raise the admission floor and drop gold pages."""
 
+    priority: list[str] = []
     variants: list[str] = []
     seen: set[str] = set()
 
-    def add(value: str) -> None:
+    def add(value: str, *, front: bool = False) -> None:
         cleaned = " ".join(value.split())
         if not cleaned or cleaned in seen:
             return
@@ -307,14 +342,28 @@ def _query_variants(question: str, terms: list[str]) -> list[str]:
         if not analyzed or len(analyzed) > 4:
             return
         seen.add(cleaned)
-        variants.append(cleaned)
+        (priority if front else variants).append(cleaned)
 
     ranked = sorted(terms, key=_rank_key)
     definition = _definition_terms(question)
+
+    # Filing phrases first — they are the highest-precision recall path.
+    folded = question.casefold()
+    for cues, phrases in _RETRIEVAL_PHRASES:
+        if any(cue in folded for cue in cues):
+            for phrase in phrases:
+                add(phrase, front=True)
+
     for term in definition:
-        add(term)
+        add(term, front=True)
     for left, right in zip(definition, definition[1:]):
-        add(f"{left} {right}")
+        add(f"{left} {right}", front=True)
+
+    # Synonym short queries map contest phrasing onto 10-K language.
+    for term in ranked[:10]:
+        for alt in _SYNONYMS.get(term, ()):
+            add(alt, front=True)
+            add(f"{term} {alt}", front=True)
 
     # Distinctive singletons (rare / long) recover pages that share only one keyword.
     for term in ranked:
@@ -333,25 +382,24 @@ def _query_variants(question: str, terms: list[str]) -> list[str]:
     if len(top) >= 4:
         add(" ".join(top[:4]))
 
-    # Synonym short queries map contest phrasing onto 10-K language.
-    for term in ranked[:10]:
-        for alt in _SYNONYMS.get(term, ()):
-            add(alt)
-            add(f"{term} {alt}")
-
-    folded = question.casefold()
-    for cues, phrases in _RETRIEVAL_PHRASES:
-        if any(cue in folded for cue in cues):
-            for phrase in phrases:
-                add(phrase)
-
     # Very short slice of the stripped question — never the full persona prompt.
     head = _ANSWER_FRAMING.sub("", question).strip(" \t\r\n.;:")
     if head:
         head_terms = [t for t in analyze_fts_query(head).split() if t not in _STOP][:4]
         if head_terms:
             add(" ".join(head_terms))
-    return variants
+    # Keep every priority phrase, then fill remaining budget with generic variants.
+    return [*priority, *variants][:36]
+
+
+_WEAK_QUERY_TERMS = frozenset(
+    """
+    product products service services business based data company like useful metric
+    profile explain relevant measure healthy reasonably change drove state report
+    reported major primary subject quantity directly outlined explicitly improve
+    improving compare compared between during after before overall roughly times
+    """.split()
+)
 
 
 def _score_page(
@@ -381,37 +429,50 @@ def _score_page(
                 continue
             idf = math.log(1.0 + (docs - df[term] + 0.5) / (df[term] + 0.5))
             denom = freq + 1.2 * (1.0 - 0.75 + 0.75 * length / avgdl)
-            local += weight * idf * (freq * 2.2) / denom
+            term_weight = 0.2 if term in _WEAK_QUERY_TERMS else 1.0
+            local += weight * term_weight * idf * (freq * 2.2) / denom
         return local
 
     score += accumulate(primary_terms, 1.0)
     # Synonyms only fill gaps; never dominate over the question's own words.
     missing_primary = [term for term in synonym_terms if term not in primary_terms]
     score += accumulate(missing_primary, 0.35)
-    covered_primary = sum(1 for term in set(primary_terms) if tf.get(term, 0))
-    score += covered_primary * 1.1
+    # Coverage bonus only for distinctive primary terms.
+    strong_primary = [term for term in set(primary_terms) if term not in _WEAK_QUERY_TERMS]
+    covered_primary = sum(1 for term in strong_primary if tf.get(term, 0))
+    score += covered_primary * 1.4
     covered_syn = sum(1 for term in set(missing_primary) if tf.get(term, 0))
-    score += covered_syn * 0.25
+    score += covered_syn * 0.2
 
     lowered = text.casefold()
     primary_fold = " ".join(primary_terms)
+
+    def has(*cues: str) -> bool:
+        return any(cue in primary_fold for cue in cues)
+
+    # Universal statement markers — light, always on.
     for marker, bonus in (
-        ("consolidated statement of income", 7.0),
-        ("consolidated statement of cash flows", 5.5),
-        ("legal proceedings", 5.0),
-        ("reportable segments", 4.0),
-        ("countries and territories", 4.0),
-        ("our operations", 2.5),
-        ("operating profit", 3.0),
-        ("depreciation and amortization", 2.5),
-        ("capital spending", 2.5),
-        ("restructuring", 1.5),
+        ("consolidated statement of income", 4.0),
+        ("consolidated statements of income", 4.0),
+        ("consolidated statements of operations", 4.0),
+        ("consolidated statement of operations", 4.0),
+        ("consolidated statement of cash flows", 3.5),
+        ("consolidated statements of cash flows", 3.5),
+        ("consolidated balance sheets", 3.5),
+        ("consolidated balance sheet", 3.5),
     ):
         if marker in lowered:
             score += bonus
 
-    # Geography questions: reward pages that list multiple operating regions.
-    if any(term.startswith("geograph") for term in primary_terms) or "geograph" in primary_fold:
+    # Query-conditional bonuses so one topic cannot drown another.
+    if has("geograph", "operates", "operate"):
+        for marker, bonus in (
+            ("reportable segments", 6.0),
+            ("countries and territories", 6.0),
+            ("our operations", 3.0),
+        ):
+            if marker in lowered:
+                score += bonus
         region_hits = sum(
             1
             for marker in (
@@ -423,14 +484,109 @@ def _score_page(
                 "africa",
                 "china region",
                 "south asia",
-                "amesa",
-                "apac",
             )
             if marker in lowered
         )
         if region_hits:
-            score += 1.8 * region_hits + (2.5 if region_hits >= 3 else 0.0)
+            score += 2.0 * region_hits + (3.0 if region_hits >= 3 else 0.0)
+
+    if has("legal", "battle", "litigation", "lawsuit"):
+        for marker, bonus in (
+            ("legal proceedings", 10.0),
+            ("controlled substances litigation", 10.0),
+            ("multidistrict litigation", 8.0),
+            ("litigation", 4.0),
+        ):
+            if marker in lowered:
+                score += bonus
+
+    if has("ebitda", "margin", "gross", "operating", "capex", "tax"):
+        for marker, bonus in (
+            ("operating profit", 4.0),
+            ("operating income", 4.0),
+            ("gross profit", 5.0),
+            ("sales of products", 4.0),
+            ("cost of sales", 3.0),
+            ("effective tax rate", 6.0),
+            ("depreciation and amortization", 3.0),
+            ("capital spending", 3.0),
+            ("consolidated statements of operations", 6.0),
+            ("consolidated statement of income", 6.0),
+        ):
+            if marker in lowered:
+                score += bonus
+
+    if has("liquidity", "quick", "ratio", "debt", "balance", "sheet", "capital"):
+        for marker, bonus in (
+            ("cash and cash equivalents", 4.0),
+            ("current assets", 3.0),
+            ("property and equipment", 5.0),
+            ("property, plant and equipment", 5.0),
+            ("long-term debt", 6.0),
+            ("outstanding long-term debt", 8.0),
+            ("consolidated balance sheets", 5.0),
+            ("consolidated operating revenues", 5.0),
+            ("consolidated statements of operations", 4.0),
+        ):
+            if marker in lowered:
+                score += bonus
+
+    if has("customer", "customers", "concentration", "cyclical", "cyclicality", "products", "services", "sells"):
+        for marker, bonus in (
+            ("commercial airlines", 10.0),
+            ("airline industry", 6.0),
+            ("government contracts", 8.0),
+            ("u.s. government", 6.0),
+            ("cyclical", 10.0),
+            ("accounted for", 6.0),
+            ("one customer", 8.0),
+            ("item 1. business", 7.0),
+            ("item 1", 4.0),
+            ("data center", 5.0),
+            ("summary of business segment data", 8.0),
+            ("summary of business segment", 7.0),
+        ):
+            if marker in lowered:
+                score += bonus
+
+    if has("segment", "categories", "percent", "revenue"):
+        for marker, bonus in (
+            ("summary of business segment data", 10.0),
+            ("summary of business segment", 8.0),
+            ("reportable segments", 5.0),
+            ("net revenue", 2.0),
+            ("net sales", 2.0),
+        ):
+            if marker in lowered:
+                score += bonus
+
+    if has("restructuring"):
+        if "restructuring" in lowered:
+            score += 4.0
+
     return score
+
+
+def _company_tokens(question: str, terms: list[str]) -> list[str]:
+    """Likely issuer / filing identity tokens used to pin the right document_id."""
+
+    out: list[str] = []
+    for term in terms:
+        if len(term) >= 4 and term not in _STOP and not term.isdigit():
+            out.append(term)
+    # Keep a few distinctive title-case-ish tokens from the raw question too.
+    for raw in _TOKEN.findall(question):
+        folded = raw.casefold()
+        if folded in _STOP or len(folded) < 4:
+            continue
+        if folded not in out and (raw[0].isupper() or folded.endswith("co") or "fy" in folded):
+            out.append(folded)
+    return out[:8]
+
+
+def _document_id_of(text: str) -> str:
+    head, _sep, _rest = text.partition("\n")
+    return head.strip()
 
 
 async def search_pdf_pages(memory, question: str, limit: int = 10) -> tuple[MemoryCitation, ...]:
@@ -448,7 +604,8 @@ async def search_pdf_pages(memory, question: str, limit: int = 10) -> tuple[Memo
         if term and term not in _STOP
     ]
     synonym_terms = _expanded_terms(primary_terms)
-    fetch = max(limit * 12, 100)
+    company = _company_tokens(question, primary_terms)
+    fetch = max(limit * 15, 120)
     variants = _query_variants(question, terms)
     if not variants:
         variants = [question.strip()]
@@ -471,13 +628,38 @@ async def search_pdf_pages(memory, question: str, limit: int = 10) -> tuple[Memo
         analyzed_hits.append((hit, tokens))
         df.update(set(tokens))
     docs = max(len(analyzed_hits), 1)
-    ranked = sorted(
-        (
-            (_score_page(hit.text, primary_terms, synonym_terms, df, docs), index, hit)
-            for index, (hit, _tokens) in enumerate(analyzed_hits)
-        ),
-        key=lambda item: (-item[0], item[1]),
-    )
+
+    scored: list[tuple[float, int, object]] = []
+    for index, (hit, _tokens) in enumerate(analyzed_hits):
+        score = _score_page(hit.text, primary_terms, synonym_terms, df, docs)
+        doc_id = _document_id_of(hit.text).casefold()
+        if company and doc_id:
+            # Pin the filing named in the question; multi-doc corpora otherwise drown gold pages.
+            matched = sum(1 for token in company if token in doc_id)
+            if matched:
+                score += 6.0 * matched
+            else:
+                # Soft penalty so cross-issuer boilerplate ranks below on-issuer pages.
+                score *= 0.72
+        # Dual-statement / profile questions need primary financial statement pages.
+        lowered = hit.text.casefold()
+        joined = " ".join(primary_terms)
+        if any(token in joined for token in ("ebitda", "capex", "margin", "gross", "tax", "liquidity", "debt", "capital")):
+            for marker, bump in (
+                ("consolidated statements of operations", 4.0),
+                ("consolidated statement of income", 4.0),
+                ("consolidated statements of income", 4.0),
+                ("consolidated statement of cash flows", 3.5),
+                ("consolidated statements of cash flows", 3.5),
+                ("consolidated balance sheets", 3.5),
+                ("property and equipment", 2.5),
+                ("long-term debt", 2.5),
+            ):
+                if marker in lowered:
+                    score += bump
+        scored.append((score, index, hit))
+
+    ranked = sorted(scored, key=lambda item: (-item[0], item[1]))
 
     citations: list[MemoryCitation] = []
     seen: set[tuple[str, str, str]] = set()

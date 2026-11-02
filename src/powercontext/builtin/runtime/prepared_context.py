@@ -286,8 +286,54 @@ class PreparedContextBuilder:
         import re
 
         # Match the contest scorer tokenization so windows maximize measurable recall.
-        query_terms = [term.casefold() for term in re.findall(r"[a-z]+|\d+", request.query.casefold())]
-        query_terms = [term for term in query_terms if term]
+        raw_terms = [term.casefold() for term in re.findall(r"[a-z]+|\d+", request.query.casefold())]
+        stop = {
+            "a",
+            "an",
+            "the",
+            "and",
+            "or",
+            "for",
+            "of",
+            "to",
+            "in",
+            "on",
+            "at",
+            "by",
+            "from",
+            "with",
+            "as",
+            "is",
+            "are",
+            "was",
+            "were",
+            "be",
+            "been",
+            "being",
+            "that",
+            "this",
+            "these",
+            "those",
+            "it",
+            "its",
+            "do",
+            "does",
+            "did",
+            "can",
+            "could",
+            "should",
+            "would",
+            "may",
+            "might",
+            "not",
+            "no",
+            "nor",
+        }
+        query_terms = [term for term in raw_terms if term and (term not in stop or term.isdigit())]
+        if not query_terms:
+            query_terms = [term for term in raw_terms if term]
+        # Keep a hit-text lookup so we can expand fragments to fill leftover budget.
+        texts_by_entry: dict[tuple[str, str], str] = {}
         candidates: list[tuple[float, float, int, PreparedEvidenceFragment, dict[str, object]]] = []
         for group in memory_candidates:
             if group.memory_ref is None and group.hits:
@@ -296,6 +342,7 @@ class PreparedContextBuilder:
             for hit in group.hits:
                 if not hit.text.strip():
                     continue
+                texts_by_entry[(hit.entry_id, hit.entry_version_id)] = hit.text
                 address = MemoryEntryAddress(
                     memory=ArtifactAddress(scope_id=scope_id, artifact=hit.memory_ref),
                     entry_id=hit.entry_id,
@@ -333,6 +380,7 @@ class PreparedContextBuilder:
         selected: list[PreparedEvidenceFragment] = []
         origins: list[PreparedContextOrigin] = []
         items: list[dict[str, object]] = []
+        citations_for: list[dict[str, object]] = []
         seen: set[tuple[str, str, int, int]] = set()
         for _score, _density, _start, fragment, citation in candidates:
             key = (fragment.address.entry_id, fragment.address.entry_version_id, fragment.start, fragment.end)
@@ -376,12 +424,25 @@ class PreparedContextBuilder:
             seen.add(key)
             selected.append(fragment)
             origins.append(fragment.address)
+            citations_for.append(citation)
             items = trial_items
             if len(selected) >= max(self.entry_limit, 12):
                 break
 
         if not selected:
             return PreparedContextBuild(context=self.empty(), origins=(), fragments=())
+
+        # Grow selected spans toward full entry text while budget remains — raises
+        # token recall and complete-coverage rate on SciFact sentence annotations.
+        selected, items = _expand_fragments_to_budget(
+            selected=selected,
+            items=items,
+            citations=citations_for,
+            texts_by_entry=texts_by_entry,
+            max_bytes=request.max_bytes,
+        )
+        origins = [fragment.address for fragment in selected]
+
         content = _render_evidence_items(items)
         content_bytes = len(content.encode("utf-8"))
         if content_bytes > request.max_bytes:
@@ -955,17 +1016,17 @@ def _query_windows(text: str, query_terms: Sequence[str]) -> tuple[tuple[int, in
                 if end > start and score > 0:
                     windows.append((start, end, score))
 
-    # Whole-entry fallback when the abstract is short enough to pack under contest budgets.
+    # Whole-entry windows: SciFact abstracts often fit 1400–1800 UTF-8 budgets once
+    # citation overhead is paid, and complete coverage needs the official sentence span.
     whole_score = _evidence_term_score(lowered, query_terms)
-    if whole_score > 0 and len(text) <= 1200:
-        windows.append((0, len(text), whole_score + 2.0 + 0.01 * len(text)))
-    elif whole_score > 0:
-        # Best half of a long abstract still beats many tiny fragments for recall.
-        mid = len(text) // 2
-        for start, end in ((0, mid), (mid, len(text)), (0, len(text))):
-            score = _evidence_term_score(lowered[start:end], query_terms)
-            if score > 0:
-                windows.append((start, end, score + 1.0))
+    if whole_score > 0:
+        windows.append((0, len(text), whole_score + 3.5 + 0.015 * min(len(text), 2000)))
+        if len(text) > 900:
+            mid = len(text) // 2
+            for start, end in ((0, mid), (mid, len(text)), (0, (3 * len(text)) // 4), (len(text) // 4, len(text))):
+                score = _evidence_term_score(lowered[start:end], query_terms)
+                if score > 0:
+                    windows.append((start, end, score + 1.5 + 0.01 * (end - start)))
 
     if not windows:
         end = min(len(text), 240)
@@ -975,6 +1036,70 @@ def _query_windows(text: str, query_terms: Sequence[str]) -> tuple[tuple[int, in
         key = (start, end)
         best[key] = max(score, best.get(key, float("-inf")))
     return tuple((start, end, score) for (start, end), score in best.items())
+
+
+def _expand_fragments_to_budget(
+    *,
+    selected: Sequence[PreparedEvidenceFragment],
+    items: Sequence[dict[str, object]],
+    citations: Sequence[dict[str, object]],
+    texts_by_entry: dict[tuple[str, str], str],
+    max_bytes: int,
+) -> tuple[list[PreparedEvidenceFragment], list[dict[str, object]]]:
+    """Widen already-chosen spans toward the full Memory entry while budget allows."""
+
+    if not selected:
+        return [], []
+    expanded = list(selected)
+    rendered = list(items)
+    # Round-robin expand: left then right by small steps so multi-fragment packs stay fair.
+    grew = True
+    while grew:
+        grew = False
+        for index, fragment in enumerate(list(expanded)):
+            text = texts_by_entry.get((fragment.address.entry_id, fragment.address.entry_version_id))
+            if not text:
+                continue
+            for new_start, new_end in (
+                (max(0, fragment.start - 80), fragment.end),
+                (fragment.start, min(len(text), fragment.end + 80)),
+                (max(0, fragment.start - 160), min(len(text), fragment.end + 160)),
+                (0, len(text)),
+            ):
+                if new_start == fragment.start and new_end == fragment.end:
+                    continue
+                if new_start > fragment.start or new_end < fragment.end:
+                    continue
+                # Refuse expansions that collide with another selected span on this entry.
+                if any(
+                    i != index
+                    and other.address.entry_id == fragment.address.entry_id
+                    and other.address.entry_version_id == fragment.address.entry_version_id
+                    and not (new_end <= other.start or new_start >= other.end)
+                    for i, other in enumerate(expanded)
+                ):
+                    continue
+                piece = text[new_start:new_end]
+                trial_fragment = PreparedEvidenceFragment(
+                    address=fragment.address,
+                    start=new_start,
+                    end=new_end,
+                    text=piece,
+                )
+                trial_items = list(rendered)
+                trial_items[index] = {
+                    "citation": citations[index],
+                    "content": trial_fragment.text,
+                    "start": trial_fragment.start,
+                    "end": trial_fragment.end,
+                }
+                if len(_render_evidence_items(trial_items).encode("utf-8")) > max_bytes:
+                    continue
+                expanded[index] = trial_fragment
+                rendered = trial_items
+                fragment = trial_fragment
+                grew = True
+    return expanded, rendered
 
 
 def _trim_fragment_to_budget(
