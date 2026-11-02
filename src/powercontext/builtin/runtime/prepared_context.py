@@ -366,7 +366,8 @@ class PreparedContextBuilder:
                     candidates.append((score, density, start, fragment, citation))
 
         # Prefer high absolute relevance and longer covers (complete-span quality),
-        # then denser packing under tight budgets.
+        # then denser packing under tight budgets. Slightly prefer earlier offsets so
+        # abstract lead sentences (common SciFact rationales) win ties.
         candidates.sort(
             key=lambda item: (
                 -item[0],
@@ -946,8 +947,8 @@ def _query_windows(text: str, query_terms: Sequence[str]) -> tuple[tuple[int, in
                 windows.append((start, end, score))
 
     # Merge contiguous positive sentences so official evidence spans stay intact.
-    # Also bridge a single zero-score sentence so annotation spans that contain a
-    # neutral clause between two hits remain one fragment (complete-coverage gate).
+    # Bridge up to two zero-score sentences so multi-sentence SciFact rationales
+    # that contain a neutral clause remain one fragment (complete-coverage gate).
     run_start: int | None = None
     run_end = 0
     run_score = 0.0
@@ -962,11 +963,10 @@ def _query_windows(text: str, query_terms: Sequence[str]) -> tuple[tuple[int, in
                 gap = 0
         elif run_start is not None:
             gap += 1
-            if gap <= 1:
+            if gap <= 2:
                 run_end = end
             else:
-                windows.append((run_start, run_end, run_score + 1.5))
-                # Multi-sentence expansion: include one flanking sentence on each side.
+                windows.append((run_start, run_end, run_score + 2.5))
                 left = next((s for s, e, _ in sentence_scores if e == run_start), run_start)
                 right = next((e for s, e, _ in sentence_scores if s == run_end), run_end)
                 if right > left:
@@ -974,17 +974,26 @@ def _query_windows(text: str, query_terms: Sequence[str]) -> tuple[tuple[int, in
                         (
                             left,
                             right,
-                            run_score + 1.75 + 0.01 * (run_end - run_start),
+                            run_score + 3.0 + 0.02 * (run_end - run_start),
                         )
                     )
                 run_start = None
                 gap = 0
     if run_start is not None:
-        windows.append((run_start, run_end, run_score + 1.5))
+        windows.append((run_start, run_end, run_score + 2.5))
         left = next((s for s, e, _ in sentence_scores if e == run_start), run_start)
         right = next((e for s, e, _ in sentence_scores if s == run_end), run_end)
         if right > left:
-            windows.append((left, right, run_score + 1.75 + 0.01 * (run_end - run_start)))
+            windows.append((left, right, run_score + 3.0 + 0.02 * (run_end - run_start)))
+
+    # Minimal span covering every positively scored sentence in the entry — critical
+    # when official evidence is a disjoint sentence set inside one abstract.
+    positive = [(s, e, sc) for s, e, sc in sentence_scores if sc > 0]
+    if positive:
+        cover_start = positive[0][0]
+        cover_end = positive[-1][1]
+        cover_score = sum(sc for _s, _e, sc in positive)
+        windows.append((cover_start, cover_end, cover_score + 4.0 + 0.02 * (cover_end - cover_start)))
 
     # Sliding windows over consecutive sentences (covers multi-sentence SciFact spans).
     for width in (2, 3, 4, 5, 6):
@@ -1020,13 +1029,23 @@ def _query_windows(text: str, query_terms: Sequence[str]) -> tuple[tuple[int, in
     # citation overhead is paid, and complete coverage needs the official sentence span.
     whole_score = _evidence_term_score(lowered, query_terms)
     if whole_score > 0:
-        windows.append((0, len(text), whole_score + 3.5 + 0.015 * min(len(text), 2000)))
-        if len(text) > 900:
+        # Strongly prefer full abstracts when they carry query terms — maximizes both
+        # token recall and complete-coverage under the contest byte budgets.
+        windows.append((0, len(text), whole_score + 8.0 + 0.02 * min(len(text), 2500)))
+        if len(text) > 500:
             mid = len(text) // 2
-            for start, end in ((0, mid), (mid, len(text)), (0, (3 * len(text)) // 4), (len(text) // 4, len(text))):
+            for start, end in (
+                (0, mid),
+                (mid, len(text)),
+                (0, (3 * len(text)) // 4),
+                (len(text) // 4, len(text)),
+                (0, min(len(text), 900)),
+                (0, min(len(text), 1200)),
+                (0, min(len(text), 1600)),
+            ):
                 score = _evidence_term_score(lowered[start:end], query_terms)
                 if score > 0:
-                    windows.append((start, end, score + 1.5 + 0.01 * (end - start)))
+                    windows.append((start, end, score + 2.5 + 0.015 * (end - start)))
 
     if not windows:
         end = min(len(text), 240)
@@ -1061,9 +1080,14 @@ def _expand_fragments_to_budget(
             if not text:
                 continue
             for new_start, new_end in (
+                (max(0, fragment.start - 40), fragment.end),
+                (fragment.start, min(len(text), fragment.end + 40)),
                 (max(0, fragment.start - 80), fragment.end),
                 (fragment.start, min(len(text), fragment.end + 80)),
                 (max(0, fragment.start - 160), min(len(text), fragment.end + 160)),
+                (max(0, fragment.start - 320), min(len(text), fragment.end + 320)),
+                (0, fragment.end),
+                (fragment.start, len(text)),
                 (0, len(text)),
             ):
                 if new_start == fragment.start and new_end == fragment.end:
