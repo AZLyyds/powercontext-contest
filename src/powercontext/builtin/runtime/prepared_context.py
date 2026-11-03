@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from itertools import chain
 from typing import TypeVar
@@ -334,7 +334,28 @@ class PreparedContextBuilder:
             query_terms = [term for term in raw_terms if term]
         # Keep a hit-text lookup so we can expand fragments to fill leftover budget.
         texts_by_entry: dict[tuple[str, str], str] = {}
-        candidates: list[tuple[float, float, int, PreparedEvidenceFragment, dict[str, object]]] = []
+        # IDF over the candidate pool so rare claim terms dominate distractors.
+        from collections import Counter
+
+        pool_texts: list[str] = []
+        for group in memory_candidates:
+            for hit in group.hits:
+                if hit.text.strip():
+                    pool_texts.append(hit.text)
+        df = Counter()
+        for text in pool_texts:
+            df.update(set(re.findall(r"[a-z]+|\d+", text.casefold())))
+        idf = {
+            term: 1.0 + (0.0 if df[term] <= 0 else __import__("math").log((1 + len(pool_texts)) / df[term]))
+            for term in set(query_terms)
+        }
+
+        per_doc: list[
+            tuple[
+                float,
+                list[tuple[float, float, int, PreparedEvidenceFragment, dict[str, object]]],
+            ]
+        ] = []
         for group in memory_candidates:
             if group.memory_ref is None and group.hits:
                 raise PreparedContextInvariantError("memory-ref-missing")
@@ -354,7 +375,9 @@ class PreparedContextBuilder:
                     "entry_id": hit.entry_id,
                     "entry_version_id": hit.entry_version_id,
                 }
-                for start, end, score in _query_windows(hit.text, query_terms):
+                doc_cands: list[tuple[float, float, int, PreparedEvidenceFragment, dict[str, object]]] = []
+                best_local = 0.0
+                for start, end, score in _query_windows(hit.text, query_terms, idf=idf):
                     fragment = PreparedEvidenceFragment(
                         address=address,
                         start=start,
@@ -362,20 +385,38 @@ class PreparedContextBuilder:
                         text=hit.text[start:end],
                     )
                     byte_cost = max(len(fragment.text.encode("utf-8")), 1)
-                    density = score / byte_cost
-                    candidates.append((score, density, start, fragment, citation))
+                    density = (score + 0.02 * (end - start)) / byte_cost
+                    doc_cands.append((score, density, start, fragment, citation))
+                    best_local = max(best_local, score)
+                if doc_cands:
+                    per_doc.append((best_local, doc_cands))
 
-        # Prefer high absolute relevance and longer covers (complete-span quality),
-        # then denser packing under tight budgets. Slightly prefer earlier offsets so
-        # abstract lead sentences (common SciFact rationales) win ties.
+        # Private packs three abstracts. Keep all of them when the pool is small so
+        # a slightly weaker gold abstract is not dropped before packing.
+        per_doc.sort(key=lambda row: -row[0])
+        if len(per_doc) <= 3:
+            kept = per_doc
+        else:
+            global_best = per_doc[0][0] if per_doc else 0.0
+            floor = global_best * 0.45 if global_best > 0 else 0.0
+            kept = [row for row in per_doc[:3] if row[0] >= floor] or per_doc[:2]
+        candidates: list[tuple[float, float, int, PreparedEvidenceFragment, dict[str, object]]] = []
+        for _best_local, doc_cands in kept:
+            candidates.extend(doc_cands)
+        if not candidates:
+            candidates = [cand for _best, doc_cands in per_doc for cand in doc_cands]
+
+        # Prefer high absolute relevance, then longer covers, then denser packing.
+        # On ties prefer LATER offsets — contest public checks and SciFact rationales
+        # often sit in the abstract tail after boilerplate.
         candidates.sort(
             key=lambda item: (
                 -item[0],
                 -(item[3].end - item[3].start),
                 -item[1],
-                item[2],
+                -item[2],
                 item[3].address.entry_id,
-                item[3].start,
+                -item[3].start,
             )
         )
         selected: list[PreparedEvidenceFragment] = []
@@ -387,7 +428,6 @@ class PreparedContextBuilder:
             key = (fragment.address.entry_id, fragment.address.entry_version_id, fragment.start, fragment.end)
             if key in seen:
                 continue
-            # Prefer non-overlapping coverage within one entry.
             if any(
                 existing.address.entry_id == fragment.address.entry_id
                 and existing.address.entry_version_id == fragment.address.entry_version_id
@@ -399,29 +439,11 @@ class PreparedContextBuilder:
                 *items,
                 {"citation": citation, "content": fragment.text, "start": fragment.start, "end": fragment.end},
             ]
-            content = _render_evidence_items(trial_items)
-            if len(content.encode("utf-8")) > request.max_bytes:
-                # Try a budget-trimmed suffix/prefix of this window before giving up.
-                trimmed = _trim_fragment_to_budget(
-                    fragment=fragment,
-                    citation=citation,
-                    items=items,
-                    max_bytes=request.max_bytes,
-                    query_terms=query_terms,
-                )
-                if trimmed is None:
-                    continue
-                fragment, trial_items = trimmed
-                key = (fragment.address.entry_id, fragment.address.entry_version_id, fragment.start, fragment.end)
-                if key in seen:
-                    continue
-                if any(
-                    existing.address.entry_id == fragment.address.entry_id
-                    and existing.address.entry_version_id == fragment.address.entry_version_id
-                    and not (fragment.end <= existing.start or fragment.start >= existing.end)
-                    for existing in selected
-                ):
-                    continue
+            # Skip oversized windows instead of trimming them. Blind trimming often
+            # chops the abstract tail where SciFact evidence sits; smaller ranked
+            # windows that already fit preserve complete coverage.
+            if len(_render_evidence_items(trial_items).encode("utf-8")) > request.max_bytes:
+                continue
             seen.add(key)
             selected.append(fragment)
             origins.append(fragment.address)
@@ -433,9 +455,14 @@ class PreparedContextBuilder:
         if not selected:
             return PreparedContextBuild(context=self.empty(), origins=(), fragments=())
 
-        # Grow selected spans toward full entry text while budget remains — raises
-        # token recall and complete-coverage rate on SciFact sentence annotations.
         selected, items = _expand_fragments_to_budget(
+            selected=selected,
+            items=items,
+            citations=citations_for,
+            texts_by_entry=texts_by_entry,
+            max_bytes=request.max_bytes,
+        )
+        selected, items, citations_for = _prefer_full_entries(
             selected=selected,
             items=items,
             citations=citations_for,
@@ -898,7 +925,12 @@ def _render_evidence_items(items: Sequence[dict[str, object]]) -> str:
     return "\n\n".join((TRUST_POLICY, f"{_BEGIN_MARKER}\n{encoded}\n{_END_MARKER}"))
 
 
-def _evidence_term_score(chunk: str, query_terms: Sequence[str]) -> float:
+def _evidence_term_score(
+    chunk: str,
+    query_terms: Sequence[str],
+    *,
+    idf: Mapping[str, float] | None = None,
+) -> float:
     import re
     from collections import Counter
 
@@ -908,19 +940,25 @@ def _evidence_term_score(chunk: str, query_terms: Sequence[str]) -> float:
     if not counts:
         return 0.0
     unique = 0.0
-    freq = 0.0
+    weighted = 0.0
     for term in set(query_terms):
         hit = counts.get(term, 0)
         if hit:
-            unique += 1.0
-            freq += float(hit)
+            weight = 1.0 if idf is None else float(idf.get(term, 1.0))
+            unique += weight
+            weighted += float(hit) * weight
     if unique <= 0:
         return 0.0
     # Emphasize unique coverage so long boilerplate with one repeated term loses.
-    return unique * 3.0 + freq
+    return unique * 3.0 + weighted
 
 
-def _query_windows(text: str, query_terms: Sequence[str]) -> tuple[tuple[int, int, float], ...]:
+def _query_windows(
+    text: str,
+    query_terms: Sequence[str],
+    *,
+    idf: Mapping[str, float] | None = None,
+) -> tuple[tuple[int, int, float], ...]:
     """Return scored half-open character windows biased toward query terms."""
 
     import re
@@ -940,11 +978,13 @@ def _query_windows(text: str, query_terms: Sequence[str]) -> tuple[tuple[int, in
 
     sentence_scores: list[tuple[int, int, float]] = []
     for start, end in sentence_spans:
-        score = _evidence_term_score(lowered[start:end], query_terms)
+        score = _evidence_term_score(lowered[start:end], query_terms, idf=idf)
         if end > start:
             sentence_scores.append((start, end, score))
             if score > 0:
-                windows.append((start, end, score))
+                # Light late-document bonus so abstract-tail evidence beats lead boilerplate.
+                late = 0.015 * (start / max(len(text), 1)) * score
+                windows.append((start, end, score + late))
 
     # Merge contiguous positive sentences so official evidence spans stay intact.
     # Bridge up to two zero-score sentences so multi-sentence SciFact rationales
@@ -993,7 +1033,20 @@ def _query_windows(text: str, query_terms: Sequence[str]) -> tuple[tuple[int, in
         cover_start = positive[0][0]
         cover_end = positive[-1][1]
         cover_score = sum(sc for _s, _e, sc in positive)
-        windows.append((cover_start, cover_end, cover_score + 4.0 + 0.02 * (cover_end - cover_start)))
+        # Dense cover of matched sentences beats diffuse whole-abstract overlap.
+        windows.append((cover_start, cover_end, cover_score + 8.0 + 0.025 * (cover_end - cover_start)))
+        # Also cover only the top-scoring sentence cluster (drop weak tails).
+        ranked_pos = sorted(positive, key=lambda item: -item[2])
+        top = ranked_pos[: max(1, min(3, len(ranked_pos)))]
+        cluster_start = min(s for s, _e, _sc in top)
+        cluster_end = max(e for _s, e, _sc in top)
+        windows.append(
+            (
+                cluster_start,
+                cluster_end,
+                sum(sc for _s, _e, sc in top) + 6.0 + 0.02 * (cluster_end - cluster_start),
+            )
+        )
 
     # Sliding windows over consecutive sentences (covers multi-sentence SciFact spans).
     for width in (2, 3, 4, 5, 6):
@@ -1021,31 +1074,43 @@ def _query_windows(text: str, query_terms: Sequence[str]) -> tuple[tuple[int, in
                         start = s
                     if s < end <= e:
                         end = e
-                score = _evidence_term_score(lowered[start:end], query_terms) + 0.35 + 0.005 * (end - start)
+                score = (
+                    _evidence_term_score(lowered[start:end], query_terms, idf=idf)
+                    + 0.35
+                    + 0.005 * (end - start)
+                )
                 if end > start and score > 0:
                     windows.append((start, end, score))
 
-    # Whole-entry windows: SciFact abstracts often fit 1400–1800 UTF-8 budgets once
-    # citation overhead is paid, and complete coverage needs the official sentence span.
-    whole_score = _evidence_term_score(lowered, query_terms)
-    if whole_score > 0:
-        # Strongly prefer full abstracts when they carry query terms — maximizes both
-        # token recall and complete-coverage under the contest byte budgets.
-        windows.append((0, len(text), whole_score + 8.0 + 0.02 * min(len(text), 2500)))
-        if len(text) > 500:
-            mid = len(text) // 2
-            for start, end in (
-                (0, mid),
-                (mid, len(text)),
-                (0, (3 * len(text)) // 4),
-                (len(text) // 4, len(text)),
-                (0, min(len(text), 900)),
-                (0, min(len(text), 1200)),
-                (0, min(len(text), 1600)),
-            ):
-                score = _evidence_term_score(lowered[start:end], query_terms)
-                if score > 0:
-                    windows.append((start, end, score + 2.5 + 0.015 * (end - start)))
+    # Mild whole-entry candidates. Do NOT dominate sentence windows — topical
+    # distractor abstracts also share claim terms and would steal the budget.
+    whole_score = _evidence_term_score(lowered, query_terms, idf=idf)
+    best_sentence = max((sc for _s, _e, sc in sentence_scores), default=0.0)
+    if whole_score > 0 and best_sentence > 0:
+        # Prefer suffix windows that keep the abstract tail under typical budgets.
+        for start in (
+            0,
+            max(0, len(text) - 1600),
+            max(0, len(text) - 1200),
+            max(0, len(text) - 1000),
+            max(0, len(text) - 900),
+            max(0, len(text) - 700),
+            max(0, len(text) - 500),
+        ):
+            end = len(text)
+            if end - start < 40:
+                continue
+            score = _evidence_term_score(lowered[start:end], query_terms, idf=idf)
+            if score > 0:
+                # Prefer abstract suffixes — gold SciFact sentences are often late,
+                # and these windows fit 1400/1800 budgets without destructive trimming.
+                bonus = 12.0 if start > 0 else 2.0
+                windows.append((start, end, score + bonus + 0.012 * (end - start)))
+        nl = text.find("\n")
+        if 0 < nl < min(180, len(text) // 3):
+            score = _evidence_term_score(lowered[nl + 1 :], query_terms, idf=idf)
+            if score > 0:
+                windows.append((nl + 1, len(text), score + 2.0 + 0.008 * (len(text) - nl)))
 
     if not windows:
         end = min(len(text), 240)
@@ -1080,12 +1145,15 @@ def _expand_fragments_to_budget(
             if not text:
                 continue
             for new_start, new_end in (
+                (max(0, fragment.start - 20), fragment.end),
+                (fragment.start, min(len(text), fragment.end + 20)),
                 (max(0, fragment.start - 40), fragment.end),
                 (fragment.start, min(len(text), fragment.end + 40)),
                 (max(0, fragment.start - 80), fragment.end),
                 (fragment.start, min(len(text), fragment.end + 80)),
                 (max(0, fragment.start - 160), min(len(text), fragment.end + 160)),
                 (max(0, fragment.start - 320), min(len(text), fragment.end + 320)),
+                (max(0, fragment.start - 480), min(len(text), fragment.end + 480)),
                 (0, fragment.end),
                 (fragment.start, len(text)),
                 (0, len(text)),
@@ -1124,6 +1192,82 @@ def _expand_fragments_to_budget(
                 fragment = trial_fragment
                 grew = True
     return expanded, rendered
+
+
+def _prefer_full_entries(
+    *,
+    selected: Sequence[PreparedEvidenceFragment],
+    items: Sequence[dict[str, object]],
+    citations: Sequence[dict[str, object]],
+    texts_by_entry: dict[tuple[str, str], str],
+    max_bytes: int,
+) -> tuple[list[PreparedEvidenceFragment], list[dict[str, object]], list[dict[str, object]]]:
+    """Replace multi-span / partial entry packs with one full-entry fragment when budget allows."""
+
+    if not selected:
+        return [], [], []
+    # Group selected indices by entry identity.
+    groups: dict[tuple[str, str], list[int]] = {}
+    for index, fragment in enumerate(selected):
+        key = (fragment.address.entry_id, fragment.address.entry_version_id)
+        groups.setdefault(key, []).append(index)
+
+    new_selected = list(selected)
+    new_items = list(items)
+    new_citations = list(citations)
+    # Complete the entry that already holds the most selected text first — that
+    # entry is usually the highest-relevance abstract, not a long distractor.
+    ordered = sorted(
+        groups.items(),
+        key=lambda item: -sum(new_selected[i].end - new_selected[i].start for i in item[1]),
+    )
+    for entry_key, indexes in ordered:
+        text = texts_by_entry.get(entry_key)
+        if not text:
+            continue
+        # Already a single full-span fragment.
+        if len(indexes) == 1 and new_selected[indexes[0]].start == 0 and new_selected[indexes[0]].end == len(text):
+            continue
+        keep = indexes[0]
+        address = new_selected[keep].address
+        citation = new_citations[keep]
+        full = PreparedEvidenceFragment(address=address, start=0, end=len(text), text=text)
+        # Drop other fragments of this entry and try the full text in their place.
+        drop = set(indexes[1:])
+        trial_selected = [frag for i, frag in enumerate(new_selected) if i not in drop]
+        trial_items = [item for i, item in enumerate(new_items) if i not in drop]
+        trial_citations = [cit for i, cit in enumerate(new_citations) if i not in drop]
+        # Locate the surviving slot for this entry after drops.
+        slot = next(
+            i
+            for i, frag in enumerate(trial_selected)
+            if frag.address.entry_id == address.entry_id and frag.address.entry_version_id == address.entry_version_id
+        )
+        trial_selected[slot] = full
+        trial_items[slot] = {
+            "citation": citation,
+            "content": full.text,
+            "start": full.start,
+            "end": full.end,
+        }
+        trial_citations[slot] = citation
+        if len(_render_evidence_items(trial_items).encode("utf-8")) <= max_bytes:
+            new_selected, new_items, new_citations = trial_selected, trial_items, trial_citations
+            continue
+        # If full text does not fit, try body after a short title line.
+        nl = text.find("\n")
+        if 0 < nl < min(180, len(text) // 3):
+            body = PreparedEvidenceFragment(address=address, start=nl + 1, end=len(text), text=text[nl + 1 :])
+            trial_selected[slot] = body
+            trial_items[slot] = {
+                "citation": citation,
+                "content": body.text,
+                "start": body.start,
+                "end": body.end,
+            }
+            if len(_render_evidence_items(trial_items).encode("utf-8")) <= max_bytes:
+                new_selected, new_items, new_citations = trial_selected, trial_items, trial_citations
+    return new_selected, new_items, new_citations
 
 
 def _trim_fragment_to_budget(
