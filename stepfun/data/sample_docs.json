@@ -1,0 +1,44 @@
+[
+  {
+    "id": "kb-001",
+    "title": "端侧 Embedding 简介",
+    "text": "在浏览器中使用 Transformers.js（ONNX Runtime）运行 Xenova/all-MiniLM-L6-v2，可优先 WebGPU，失败时降级到 WASM。量化可选 INT8（q8）或 FP16，无需云端推理 API。",
+    "tags": ["embedding", "webgpu", "wasm"],
+    "source": "sample"
+  },
+  {
+    "id": "kb-002",
+    "title": "SeekDB 混合检索",
+    "text": "SeekDB（seekdb-js / npm: seekdb）支持全文索引与向量索引。应调用 collection.hybridSearch，在数据库内融合关键词与语义召回，禁止在客户端分别检索后自行拼合结果。",
+    "tags": ["seekdb", "hybrid"],
+    "source": "sample"
+  },
+  {
+    "id": "kb-003",
+    "title": "迷你知识库写入流程",
+    "text": "推荐流程：导入文档 → 浏览器本地向量化 → 将 id/document/embedding/metadata 写入 SeekDB 集合 → 查询时同样本地向量化 query，再请求库内 hybridSearch。",
+    "tags": ["pipeline", "rag"],
+    "source": "sample"
+  },
+  {
+    "id": "kb-004",
+    "title": "量化体积与质量",
+    "text": "INT8（q8）模型体积更小、WASM 推理更友好；FP16 在 WebGPU 上通常更快且精度更高。提交材料中应对比下载体积、首 token/首条 embedding 时延与检索质量。",
+    "tags": ["quantization", "benchmark"],
+    "source": "sample"
+  },
+  {
+    "id": "kb-005",
+    "title": "PowerContext 与本地知识库",
+    "text": "本迷你知识库可作为 PowerContext 的本地证据源补充：端侧隐私友好，向量不出浏览器；若需持久化与多端共享，再通过 SeekDB Server 模式集中存储。",
+    "tags": ["powercontext", "privacy"],
+    "source": "sample"
+  },
+  {
+    "id": "kb-006",
+    "title": "常见报错：CORS 与模型缓存",
+    "text": "首次加载 Hugging Face / CDN 模型需要网络。若企业网拦截，可预下载 onnx 权重到 public/models 并配置 env.localModelPath。IndexedDB 可用于演示后端缓存文档与向量。",
+    "tags": ["ops", "cache"],
+    "source": "sample"
+  }
+]

@@ -1,0 +1,29 @@
+{
+  "task": "Implement SPEC-PRICE-001 inclusive min_price max_price filter in sample_app/catalog.py",
+  "specs": [
+    "specs/SPEC-PRICE-001.md"
+  ],
+  "code": [
+    "sample_app/catalog.py"
+  ],
+  "tests": [
+    "sample_app/tests/test_catalog.py"
+  ],
+  "db_query_log": {
+    "engine": "sqlite-dev",
+    "mode": "sqlite",
+    "host": "127.0.0.1",
+    "port": 2881,
+    "database": "sdd_minimax",
+    "query": "Implement SPEC-PRICE-001 inclusive min_price max_price filter in sample_app/catalog.py",
+    "hit_count": 1,
+    "hits": [
+      {
+        "kind": "code",
+        "path": "sample_app/catalog.py",
+        "title": "catalog.py",
+        "score": "sqlite-like"
+      }
+    ]
+  }
+}

@@ -1,0 +1,13 @@
+============================= test session starts =============================
+platform win32 -- Python 3.13.0, pytest-9.2.0, pluggy-1.7.0 -- C:\Users\jiwei\AppData\Local\Programs\Python\Python313\python.exe
+cachedir: .pytest_cache
+rootdir: C:\Users\jiwei\Desktop\stt\垃圾\oceanbase-miniob\powercontext-contest\minimax
+plugins: anyio-4.16.0
+collecting ... collected 4 items
+
+sample_app/tests/test_catalog.py::test_category_filter PASSED            [ 25%]
+sample_app/tests/test_catalog.py::test_price_range_inclusive PASSED      [ 50%]
+sample_app/tests/test_catalog.py::test_price_only_min PASSED             [ 75%]
+sample_app/tests/test_catalog.py::test_empty_when_no_match PASSED        [100%]
+
+============================== 4 passed in 0.05s ==============================

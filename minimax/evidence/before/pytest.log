@@ -1,0 +1,72 @@
+============================= test session starts =============================
+platform win32 -- Python 3.13.0, pytest-9.2.0, pluggy-1.7.0 -- C:\Users\jiwei\AppData\Local\Programs\Python\Python313\python.exe
+cachedir: .pytest_cache
+rootdir: C:\Users\jiwei\Desktop\stt\垃圾\oceanbase-miniob\powercontext-contest\minimax
+plugins: anyio-4.16.0
+collecting ... collected 4 items
+
+sample_app/tests/test_catalog.py::test_category_filter PASSED            [ 25%]
+sample_app/tests/test_catalog.py::test_price_range_inclusive FAILED      [ 50%]
+sample_app/tests/test_catalog.py::test_price_only_min FAILED             [ 75%]
+sample_app/tests/test_catalog.py::test_empty_when_no_match FAILED        [100%]
+
+================================== FAILURES ===================================
+_________________________ test_price_range_inclusive __________________________
+
+    def test_price_range_inclusive() -> None:
+        items = demo_catalog()
+        got = filter_products(items, category="merch", min_price=10.0, max_price=50.0)
+>       assert [p["id"] for p in got] == [1]
+E       assert [1, 2, 3] == [1]
+E         
+E         Left contains 2 more items, first extra item: 2
+E         
+E         Full diff: (-: missing in left side, +: extra in left side)
+E           [
+E               1,
+E         +     2,
+E         +     3,
+E           ]
+
+sample_app\tests\test_catalog.py:28: AssertionError
+_____________________________ test_price_only_min _____________________________
+
+    def test_price_only_min() -> None:
+        items = demo_catalog()
+        got = filter_products(items, min_price=100.0)
+>       assert [p["id"] for p in got] == [2]
+E       AssertionError: assert [1, 2, 3, 4, 5] == [2]
+E         
+E         At index 0 diff: 1 != 2
+E         Left contains 4 more items, first extra item: 2
+E         
+E         Full diff: (-: missing in left side, +: extra in left side)
+E           [
+E         +     1,...
+E         
+E         ...Full output truncated, use '-vv' to show
+
+sample_app\tests\test_catalog.py:34: AssertionError
+__________________________ test_empty_when_no_match ___________________________
+
+    def test_empty_when_no_match() -> None:
+        items = demo_catalog()
+        got = filter_products(items, category="merch", min_price=500.0)
+>       assert got == []
+E       AssertionError: assert [{'id': 1, 'n...'price': 9.0}] == []
+E         
+E         Left contains 3 more items, first extra item: {'id': 1, 'name': 'seekdb mug', 'category': 'merch', 'price': 39.0}
+E         
+E         Full diff: (-: missing in left side, +: extra in left side)
+E         - []
+E         + [
+E         +     {...
+E         
+E         ...Full output truncated, use '-vv' to show
+
+sample_app\tests\test_catalog.py:40: AssertionError
+=========================== short test summary info ===========================
+FAILED sample_app/tests/test_catalog.py::test_price_range_inclusive - assert ...
+FAILED sample_app/tests/test_catalog.py::test_price_only_min - AssertionError...
+FAILED sample_app/tests/test_catalog.py::test_empty_when_no_match - Assertion...
+========================= 3 failed, 1 passed in 0.25s =========================

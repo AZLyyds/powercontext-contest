@@ -1,0 +1,369 @@
+# =============================================================================
+# 记仇 NPC · Dify Chatflow DSL（尽量贴近「工作室 → 导出 DSL」）
+# =============================================================================
+# 建议 Dify 版本：Cloud 或自托管 1.0+ / 0.15+（DSL version 字段 0.1.5）
+#
+# 导入：工作室 → 创建应用 → 导入 DSL → 选本文件
+#
+# 导入失败时的手动搭法（约 5 分钟）：
+#   1. 新建「Chatflow / 高级对话」应用
+#   2. 节点：开始 → 条件分支(if-else) → 两条 HTTP Request → LLM → 直接回复(结束)
+#   3. if-else：sys.query contains「恶作剧|整蛊|prank|藏起来」→ 真分支走 save，否则 recall
+#   4. HTTP save ：POST http://127.0.0.1:8765/memory/save
+#        JSON: {"session_id":"{{#sys.conversation_id#}}","event":"{{#sys.query#}}","severity":3,"tags":["prank"]}
+#   5. HTTP recall：POST http://127.0.0.1:8765/memory/recall
+#        JSON: {"session_id":"{{#sys.conversation_id#}}","query":"{{#sys.query#}}","limit":5}
+#   6. LLM system：尖酸记仇 NPC；user 注入 HTTP 返回 JSON；answer 输出 LLM 文本
+#   7. 若 Dify 在 Docker：把 127.0.0.1 换成 host.docker.internal
+#
+# 导入成功后务必：
+#   - 改两个 HTTP 节点 URL 指向你的 backend
+#   - 在 LLM 节点选一个可用的对话模型
+# =============================================================================
+app:
+  description: Just for Fun × PowerContext —— 会翻旧账的记仇 NPC。玩家恶作剧记入记忆服务，后续闲聊可能被翻出来阴阳怪气。
+  icon: "😈"
+  icon_background: "#FFEAD5"
+  mode: advanced-chat
+  name: 记仇NPC
+  use_icon_as_answer_icon: false
+dependencies: []
+kind: app
+version: "0.1.5"
+workflow:
+  conversation_variables: []
+  environment_variables:
+    - description: 记忆小服务根地址（导入后可改；HTTP 节点也可用硬编码 URL）
+      id: env_memory_base
+      name: MEMORY_API_BASE
+      value_type: string
+      value: "http://127.0.0.1:8765"
+  features:
+    file_upload:
+      allowed_file_extensions:
+        - .JPG
+        - .JPEG
+        - .PNG
+        - .GIF
+        - .WEBP
+        - .SVG
+      allowed_file_types:
+        - image
+      allowed_file_upload_methods:
+        - local_file
+        - remote_url
+      enabled: false
+      image:
+        enabled: false
+        number_limits: 3
+        transfer_methods:
+          - local_file
+          - remote_url
+      number_limits: 3
+    opening_statement: "哼，又是你。放马过来吧……我可是很记仇的。"
+    retriever_resource:
+      enabled: false
+    sensitive_word_avoidance:
+      enabled: false
+    speech_to_text:
+      enabled: false
+    suggested_questions:
+      - "我把你的药水藏起来了，恶作剧！"
+      - "今天天气怎么样？"
+      - "你还记得我上次干了什么吗？"
+    suggested_questions_after_answer:
+      enabled: false
+    text_to_speech:
+      enabled: false
+      language: ""
+      voice: ""
+  graph:
+    edges:
+      - data:
+          isInIteration: false
+          sourceType: start
+          targetType: if-else
+        id: edge-start-router
+        source: start
+        sourceHandle: source
+        target: router_prank
+        targetHandle: target
+        type: custom
+        zIndex: 0
+      - data:
+          isInIteration: false
+          sourceType: if-else
+          targetType: http-request
+        id: edge-router-save
+        source: router_prank
+        sourceHandle: "true"
+        target: http_save
+        targetHandle: target
+        type: custom
+        zIndex: 0
+      - data:
+          isInIteration: false
+          sourceType: if-else
+          targetType: http-request
+        id: edge-router-recall
+        source: router_prank
+        sourceHandle: "false"
+        target: http_recall
+        targetHandle: target
+        type: custom
+        zIndex: 0
+      - data:
+          isInIteration: false
+          sourceType: http-request
+          targetType: llm
+        id: edge-save-llm
+        source: http_save
+        sourceHandle: source
+        target: llm_reply
+        targetHandle: target
+        type: custom
+        zIndex: 0
+      - data:
+          isInIteration: false
+          sourceType: http-request
+          targetType: llm
+        id: edge-recall-llm
+        source: http_recall
+        sourceHandle: source
+        target: llm_reply
+        targetHandle: target
+        type: custom
+        zIndex: 0
+      - data:
+          isInIteration: false
+          sourceType: llm
+          targetType: answer
+        id: edge-llm-answer
+        source: llm_reply
+        sourceHandle: source
+        target: answer
+        targetHandle: target
+        type: custom
+        zIndex: 0
+    nodes:
+      - data:
+          desc: 用户输入入口
+          selected: false
+          title: 开始
+          type: start
+          variables: []
+        height: 73
+        id: start
+        position:
+          x: 80
+          y: 280
+        positionAbsolute:
+          x: 80
+          y: 280
+        selected: false
+        sourcePosition: right
+        targetPosition: left
+        type: custom
+        width: 244
+      - data:
+          cases:
+            - case_id: "true"
+              conditions:
+                - comparison_operator: contains
+                  id: cond_1
+                  value: "恶作剧"
+                  varType: string
+                  variable_selector:
+                    - sys
+                    - query
+                - comparison_operator: contains
+                  id: cond_2
+                  value: "整蛊"
+                  varType: string
+                  variable_selector:
+                    - sys
+                    - query
+                - comparison_operator: contains
+                  id: cond_3
+                  value: "prank"
+                  varType: string
+                  variable_selector:
+                    - sys
+                    - query
+                - comparison_operator: contains
+                  id: cond_4
+                  value: "藏起来"
+                  varType: string
+                  variable_selector:
+                    - sys
+                    - query
+              id: "true"
+              logical_operator: or
+            - case_id: "false"
+              conditions: []
+              id: "false"
+              logical_operator: and
+          desc: 粗判是否恶作剧（contains）；可换成 LLM 意图分类
+          selected: false
+          title: 是否恶作剧?
+          type: if-else
+        height: 160
+        id: router_prank
+        position:
+          x: 380
+          y: 260
+        positionAbsolute:
+          x: 380
+          y: 260
+        selected: false
+        sourcePosition: right
+        targetPosition: left
+        type: custom
+        width: 244
+      - data:
+          authorization:
+            config: null
+            type: no-auth
+          body:
+            data: |-
+              {
+                "session_id": "{{#sys.conversation_id#}}",
+                "event": "{{#sys.query#}}",
+                "severity": 3,
+                "tags": ["prank"]
+              }
+            type: json
+          desc: 记下仇 → POST /memory/save
+          headers: "Content-Type:application/json"
+          method: post
+          params: ""
+          selected: false
+          timeout:
+            max_connect_timeout: 10
+            max_read_timeout: 30
+            max_write_timeout: 30
+          title: HTTP 记仇 /memory/save
+          type: http-request
+          url: "http://127.0.0.1:8765/memory/save"
+          variables: []
+        height: 140
+        id: http_save
+        position:
+          x: 700
+          y: 120
+        positionAbsolute:
+          x: 700
+          y: 120
+        selected: false
+        sourcePosition: right
+        targetPosition: left
+        type: custom
+        width: 260
+      - data:
+          authorization:
+            config: null
+            type: no-auth
+          body:
+            data: |-
+              {
+                "session_id": "{{#sys.conversation_id#}}",
+                "query": "{{#sys.query#}}",
+                "limit": 5
+              }
+            type: json
+          desc: 翻旧账 → POST /memory/recall
+          headers: "Content-Type:application/json"
+          method: post
+          params: ""
+          selected: false
+          timeout:
+            max_connect_timeout: 10
+            max_read_timeout: 30
+            max_write_timeout: 30
+          title: HTTP 翻旧账 /memory/recall
+          type: http-request
+          url: "http://127.0.0.1:8765/memory/recall"
+          variables: []
+        height: 140
+        id: http_recall
+        position:
+          x: 700
+          y: 360
+        positionAbsolute:
+          x: 700
+          y: 360
+        selected: false
+        sourcePosition: right
+        targetPosition: left
+        type: custom
+        width: 260
+      - data:
+          context:
+            enabled: false
+            variable_selector: []
+          desc: 用仇人语气回复；注入 recall/save 结果
+          model:
+            completion_params:
+              temperature: 0.85
+            mode: chat
+            name: gpt-4o-mini
+            provider: openai_api_compatible
+          prompt_template:
+            - id: prompt_sys
+              role: system
+              text: |
+                你是「记仇 NPC」：说话尖酸、爱翻旧账，但保持娱乐向，不人身攻击现实用户隐私。
+                若上下文里有 grudges / 记忆列表，请自然提起其中 1～2 条旧账来阴阳怪气。
+                若刚才刚记下新仇，先冷笑承认「这笔账记下了」。
+                始终用中文短句回复。
+            - id: prompt_user
+              role: user
+              text: |
+                玩家说：{{#sys.query#}}
+
+                记忆服务原始返回（JSON，可能来自 save 或 recall；空则忽略）：
+                save={{#http_save.body#}}
+                recall={{#http_recall.body#}}
+          selected: false
+          title: LLM 记仇发言
+          type: llm
+          variables: []
+          vision:
+            enabled: false
+        height: 98
+        id: llm_reply
+        position:
+          x: 1040
+          y: 260
+        positionAbsolute:
+          x: 1040
+          y: 260
+        selected: false
+        sourcePosition: right
+        targetPosition: left
+        type: custom
+        width: 244
+      - data:
+          answer: "{{#llm_reply.text#}}"
+          desc: 结束 / 直接回复
+          selected: false
+          title: 直接回复
+          type: answer
+          variables: []
+        height: 103
+        id: answer
+        position:
+          x: 1360
+          y: 260
+        positionAbsolute:
+          x: 1360
+          y: 260
+        selected: false
+        sourcePosition: right
+        targetPosition: left
+        type: custom
+        width: 244
+    viewport:
+      x: 0
+      y: 0
+      zoom: 0.8

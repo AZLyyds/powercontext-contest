@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>StepFun · 端侧 Embedding + SeekDB 混合检索</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <main class="app">
+      <header class="hero">
+        <p class="eyebrow">PowerContext Contest · stepfun</p>
+        <h1>迷你知识库</h1>
+        <p class="lead">
+          浏览器本地 Transformers.js 向量化 → 写入检索后端 →
+          <strong>库内混合检索</strong>（禁止前端拼合两路结果）
+        </p>
+      </header>
+
+      <section class="panel status-panel">
+        <h2>运行状态</h2>
+        <ul id="status-list">
+          <li>后端：<span id="backend-label">未初始化</span></li>
+          <li>Embedding 设备：<span id="device-label">—</span></li>
+          <li>模型：<span id="model-label">Xenova/all-MiniLM-L6-v2</span></li>
+          <li>文档数：<span id="doc-count">0</span></li>
+        </ul>
+        <pre id="log" class="log" aria-live="polite"></pre>
+      </section>
+
+      <section class="panel">
+        <h2>1. 导入语料</h2>
+        <p class="hint">默认加载 <code>data/sample_docs.json</code>，也可粘贴 JSON 数组。</p>
+        <div class="row">
+          <button id="btn-load-sample" type="button">加载示例语料</button>
+          <button id="btn-import" type="button">导入并向量化写入</button>
+        </div>
+        <textarea
+          id="docs-input"
+          rows="10"
+          placeholder='[{"id":"doc-1","title":"...","text":"...","tags":[]}]'
+        ></textarea>
+      </section>
+
+      <section class="panel">
+        <h2>2. 混合检索</h2>
+        <p class="hint">查询向量在本地生成，全文+向量融合由后端 <code>hybridSearch</code> 一次性完成。</p>
+        <div class="row">
+          <input id="query-input" type="search" placeholder="例如：如何在浏览器跑 INT8 embedding？" />
+          <button id="btn-search" type="button">检索</button>
+        </div>
+        <div id="results" class="results"></div>
+      </section>
+    </main>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

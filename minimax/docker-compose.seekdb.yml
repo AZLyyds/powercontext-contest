@@ -1,0 +1,11 @@
+# Optional local seekdb / OceanBase MySQL endpoint for the MiniMax SDD demo.
+# Image tag may vary by contest docs — adjust if pull fails.
+services:
+  seekdb:
+    image: oceanbase/seekdb:latest
+    ports:
+      - "2881:2881"
+    environment:
+      MODE: mini
+    # If this image is unavailable, point SEEKDB_* at any MySQL-compatible
+    # OceanBase / seekdb instance that supports FULLTEXT on InnoDB.

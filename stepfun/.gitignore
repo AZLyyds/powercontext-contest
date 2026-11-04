@@ -1,0 +1,9 @@
+node_modules/
+sidecar/node_modules/
+dist/
+.vite/
+.env
+.env.local
+*.log
+sidecar/seekdb.db/
+*.db/

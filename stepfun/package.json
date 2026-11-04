@@ -1,0 +1,27 @@
+{
+  "name": "stepfun-local-hybrid-kb",
+  "version": "0.1.0",
+  "private": true,
+  "description": "端侧 Transformers.js embedding + seekdb 混合检索迷你知识库（赛题骨架）",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "sidecar": "npm --prefix sidecar run start",
+    "sidecar:install": "npm --prefix sidecar install --no-fund --no-audit"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^3.4.0"
+  },
+  "devDependencies": {
+    "vite": "^6.2.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "notes": {
+    "transformers": "官方包已从 @xenova/transformers 迁到 @huggingface/transformers；二者 API 相近。若需锁定旧包可改回 @xenova/transformers@^2.17.2。",
+    "seekdb": "SeekDB SDK（npm: seekdb）仅安装在 sidecar/，浏览器经 VITE_SEEKDB_PROXY 调用。仓库：https://github.com/oceanbase/seekdb-js"
+  }
+}

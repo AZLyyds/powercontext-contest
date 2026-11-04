@@ -1,0 +1,36 @@
+{
+  "mode": "file",
+  "path": "C:\\Users\\jiwei\\Desktop\\stt\\垃圾\\oceanbase-miniob\\powercontext-contest\\minimax\\evidence\\pc_state\\price-001.json",
+  "record": {
+    "scope": "minimax-sdd-demo",
+    "kind": "minimax_sdd_task_state",
+    "payload": {
+      "task_id": "price-001",
+      "saved_at": "2026-11-04T10:42:52.347611+00:00",
+      "state": {
+        "task": "Implement SPEC-PRICE-001 inclusive min_price max_price filter in sample_app/catalog.py",
+        "required_specs": [
+          "specs/SPEC-PRICE-001.md"
+        ],
+        "required_code": [
+          "sample_app/catalog.py"
+        ],
+        "required_tests": [
+          "sample_app/tests/test_catalog.py"
+        ],
+        "done": [
+          "ingest",
+          "context_built",
+          "minimax_patch"
+        ],
+        "todo": [
+          "run_tests",
+          "review"
+        ],
+        "extra": {
+          "after_tests_exit": 0
+        }
+      }
+    }
+  }
+}

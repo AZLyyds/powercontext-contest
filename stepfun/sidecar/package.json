@@ -1,0 +1,17 @@
+﻿{
+  "name": "stepfun-seekdb-sidecar",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "SeekDB HTTP proxy for browser embedding + in-DB hybridSearch",
+  "scripts": {
+    "start": "node server.js",
+    "sidecar": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "seekdb": "^1.4.0"
+  }
+}
