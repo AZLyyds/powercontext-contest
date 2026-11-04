@@ -1,6 +1,6 @@
 ---
 name: nearby-places-explorer
-description: 周边去哪儿——根据起点坐标与自然语言需求，用高德 MCP 搜索附近地点并核对步行可达性，推荐最多 3 个地点。
+description: "根据起点坐标与自然语言需求，用高德 MCP 搜索附近地点并核对步行可达性，推荐最多 3 个地点。Use when the user asks for nearby places, walking-distance recommendations, or Amap/Gaode POI search."
 ---
 
 # 周边去哪儿（高德地点推荐助手）
@@ -118,3 +118,7 @@ description: 周边去哪儿——根据起点坐标与自然语言需求，用�
 - [ ] 未把超时地点标为符合条件  
 - [ ] 推荐 ≤ 3，排序符合「优先近」时的近→远  
 - [ ] 未编造未核实信息  
+
+## OceanBase 大赛作品归属验证
+
+<!-- OB-S:P2uJ6crwkm7wgSjWuapTnA -->
